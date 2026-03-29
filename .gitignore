@@ -1,0 +1,10 @@
+data/
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
+.venv/
+visualizations/
+model/
+outputs/
+download_data.ipynb
+scores.txt

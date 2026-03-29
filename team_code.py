@@ -314,12 +314,12 @@ def extract_physiological_features(physiological_data, physiological_fs, csv_pat
 
     leads_to_check = {
         'eeg':  ['f3-m2', 'f4-m1', 'c3-m2', 'c4-m1'],
-        'eog':  ['e1-m2', 'e2-m1'],
-        'chin': ['chin1-chin2', 'chin'],
-        'leg':  ['lat', 'rat'],
-        'ecg':  ['ecg', 'ekg'],
-        'resp': ['airflow', 'ptaf', 'abd', 'chest'],
-        'spo2': ['spo2', 'sao2'] # Added sao2 as fallback for spo2
+        # 'eog':  ['e1-m2', 'e2-m1'],
+        # 'chin': ['chin1-chin2', 'chin'],
+        # 'leg':  ['lat', 'rat'],
+        # 'ecg':  ['ecg', 'ekg'],
+        # 'resp': ['airflow', 'ptaf', 'abd', 'chest'],
+        # 'spo2': ['spo2', 'sao2'] # Added sao2 as fallback for spo2
     }
     
     final_features = []
@@ -334,69 +334,71 @@ def extract_physiological_features(physiological_data, physiological_fs, csv_pat
                 fs = processed_fs.get(candidate)
                 break 
 
-        # if sig is not None and len(sig) > 0 and fs is not None:
-        #     # --- 1. Time Domain Features ---
-        #     std_val = np.std(sig)
-        #     mav_val = np.mean(np.abs(sig))
-        #     energy_val = np.sum(sig**2) / len(sig)
-            
-        #     # --- 2. Frequency Domain Features (Spectral) ---
-        #     n = len(sig)
-        #     # Correct spacing for frequency axis based on channel-specific fs
-        #     freqs = np.fft.rfftfreq(n, d=1/fs)
-            
-        #     # Compute Power Spectral Density (PSD)
-        #     # Multiplied by 2 for rfft (except DC/Nyquist) and divided by fs for density
-        #     fft_res = np.abs(np.fft.rfft(sig))
-        #     psd = (fft_res**2) / (n * fs)
-            
-        #     # Define band masks
-        #     delta_mask = (freqs >= 0.5) & (freqs <= 4)
-        #     theta_mask = (freqs > 4) & (freqs <= 8)
-        #     alpha_mask = (freqs > 8) & (freqs <= 12)
-            
-        #     # Calculate power in bands using trapezoidal integration for physical accuracy
-        #     delta_p = np.trapezoid(psd[delta_mask], freqs[delta_mask]) if np.any(delta_mask) else 0.0
-        #     theta_p = np.trapezoid(psd[theta_mask], freqs[theta_mask]) if np.any(theta_mask) else 0.0
-        #     alpha_p = np.trapezoid(psd[alpha_mask], freqs[alpha_mask]) if np.any(alpha_mask) else 0.0
-            
-        #     # Ratio biomarker: Delta/Theta (Indicator of cognitive slowing)
-        #     dt_ratio = delta_p / theta_p if theta_p > 0 else 0.0
-
-        #     final_features.extend([std_val, mav_val, energy_val, delta_p, theta_p, alpha_p, dt_ratio])
-
-        if sig is not None and len(sig) > 1:
-            # --- Time Domain Features (Very Fast) ---
+        if sig is not None and len(sig) > 0 and fs is not None:
+            # --- 1. Time Domain Features ---
             std_val = np.std(sig)
             mav_val = np.mean(np.abs(sig))
+            energy_val = np.sum(sig**2) / len(sig)
             
-            # Zero Crossing Rate (Proxy for frequency/slowing)
-            zcr = np.mean(np.diff(np.sign(sig)) != 0)
+            # --- 2. Frequency Domain Features (Spectral) ---
+            n = len(sig)
+            # Correct spacing for frequency axis based on channel-specific fs
+            freqs = np.fft.rfftfreq(n, d=1/fs)
             
-            # Root Mean Square
-            rms = np.sqrt(np.mean(sig**2))
+            # Compute Power Spectral Density (PSD)
+            # Multiplied by 2 for rfft (except DC/Nyquist) and divided by fs for density
+            fft_res = np.abs(np.fft.rfft(sig))
+            psd = (fft_res**2) / (n * fs)
             
-            # Signal Activity (Variance)
-            activity = np.var(sig)
+            # Define band masks
+            delta_mask = (freqs >= 0.5) & (freqs <= 4)
+            theta_mask = (freqs > 4) & (freqs <= 8)
+            alpha_mask = (freqs > 8) & (freqs <= 12)
             
-            # Mobility (Hjorth Parameter) - Proxy for mean frequency
-            # sqrt(var(diff(sig)) / var(sig))
-            diff_sig = np.diff(sig)
-            mobility = np.sqrt(np.var(diff_sig) / activity) if activity > 0 else 0.0
+            # Calculate power in bands using trapezoidal integration for physical accuracy
+            delta_p = np.trapezoid(psd[delta_mask], freqs[delta_mask]) if np.any(delta_mask) else 0.0
+            theta_p = np.trapezoid(psd[theta_mask], freqs[theta_mask]) if np.any(theta_mask) else 0.0
+            alpha_p = np.trapezoid(psd[alpha_mask], freqs[alpha_mask]) if np.any(alpha_mask) else 0.0
+            
+            # Ratio biomarker: Delta/Theta (Indicator of cognitive slowing)
+            dt_ratio = delta_p / theta_p if theta_p > 0 else 0.0
 
-            # Complexity (Hjorth Parameter) - Proxy for bandwidth
-            diff2_sig = np.diff(diff_sig)
-            var_d2 = np.var(diff2_sig)
-            var_d1 = np.var(diff_sig)
-            complexity = (np.sqrt(var_d2 / var_d1) / mobility) if (var_d1 > 0 and mobility > 0) else 0.0
+            final_features.extend([std_val, mav_val, energy_val, delta_p, theta_p, alpha_p, dt_ratio])
 
-            final_features.extend([std_val, mav_val, zcr, rms, activity, mobility, complexity])
+        # if sig is not None and len(sig) > 1:
+        #     # --- Time Domain Features (Very Fast) ---
+        #     std_val = np.std(sig)
+        #     mav_val = np.mean(np.abs(sig))
+            
+        #     # Zero Crossing Rate (Proxy for frequency/slowing)
+        #     zcr = np.mean(np.diff(np.sign(sig)) != 0)
+            
+        #     # Root Mean Square
+        #     rms = np.sqrt(np.mean(sig**2))
+            
+        #     # Signal Activity (Variance)
+        #     activity = np.var(sig)
+            
+        #     # Mobility (Hjorth Parameter) - Proxy for mean frequency
+        #     # sqrt(var(diff(sig)) / var(sig))
+        #     diff_sig = np.diff(sig)
+        #     mobility = np.sqrt(np.var(diff_sig) / activity) if activity > 0 else 0.0
+
+        #     # Complexity (Hjorth Parameter) - Proxy for bandwidth
+        #     diff2_sig = np.diff(diff_sig)
+        #     var_d2 = np.var(diff2_sig)
+        #     var_d1 = np.var(diff_sig)
+        #     complexity = (np.sqrt(var_d2 / var_d1) / mobility) if (var_d1 > 0 and mobility > 0) else 0.0
+
+        #     final_features.extend([std_val, mav_val, zcr, rms, activity, mobility, complexity])
 
         else:
             # Padding: 7 features per lead type
             final_features.extend([0.0] * 7)
 
     if 'processed_channels' in locals(): del processed_channels
+
+    # shape would be 7, 7, 7, 7, 7, 7 = 49 features total
 
     return np.array(final_features)
 
