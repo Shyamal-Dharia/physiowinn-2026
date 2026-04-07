@@ -8,3 +8,7 @@ model/
 outputs/
 download_data.ipynb
 scores.txt
+.codex
+.window_cache
+model_exp_a
+model_exp_b

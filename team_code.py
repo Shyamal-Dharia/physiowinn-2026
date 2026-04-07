@@ -18,7 +18,9 @@
 ################################################################################
 
 import copy
+import hashlib
 import joblib
+import json
 import math
 import numpy as np
 import os
@@ -32,6 +34,8 @@ from functools import lru_cache
 from scipy import signal
 from sklearn.dummy import DummyClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, average_precision_score, f1_score, roc_auc_score
+from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
@@ -74,14 +78,14 @@ FILTER_ORDER = 4
 ROBUST_CLIP_PERCENTILE = 99.5
 
 PATCH_SIZE = 16
-EMBED_DIM = 128
-TRANSFORMER_DEPTH = 8
+EMBED_DIM = int(os.environ.get('PN2026_EMBED_DIM', '256'))
+TRANSFORMER_DEPTH = int(os.environ.get('PN2026_TRANSFORMER_DEPTH', '8'))
 TRANSFORMER_HEADS = 8
 TRANSFORMER_MLP_RATIO = 4
 TRANSFORMER_DROPOUT = 0.1
 
 MASK_RATIO = 0.5
-PRETRAIN_EPOCHS = 2
+PRETRAIN_EPOCHS = int(os.environ.get('PN2026_PRETRAIN_EPOCHS', '5'))
 PRETRAIN_BATCH_SIZE = 64
 PROBE_BATCH_SIZE = 128
 PRETRAIN_LR = 1e-3
@@ -91,8 +95,22 @@ MAX_GRAD_NORM = 1.0
 PRETRAIN_NUM_WORKERS = 0
 
 WINDOW_CACHE_DIRNAME = 'window_cache'
+WINDOW_CACHE_ROOT = os.path.join(SCRIPT_DIR, '.window_cache')
+WINDOW_CACHE_MANIFEST = 'manifest.json'
+WINDOW_CACHE_VERSION = 1
+REUSE_LOCAL_WINDOW_CACHE = True
+KEEP_LOCAL_WINDOW_CACHE = True
 
 RANDOM_STATE = 56
+
+INTERNAL_EXPERIMENT_MODE = os.environ.get('PN2026_INTERNAL_EXPERIMENT', '0').strip().lower() in ('1', 'true', 'yes', 'y')
+INTERNAL_TRAIN_FRACTION = 0.80
+INTERNAL_VAL_FRACTION = 0.10
+INTERNAL_TEST_FRACTION = 0.10
+INTERNAL_SPLIT_SEED = RANDOM_STATE
+INTERNAL_REFIT_ON_TRAIN_VAL = True
+INTERNAL_METRICS_FILENAME = 'internal_metrics.json'
+INTERNAL_SPLIT_FILENAME = 'internal_split.csv'
 
 ################################################################################
 #
@@ -120,24 +138,81 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
     if not probe_records:
         raise RuntimeError('No labeled EEG recordings were found for the linear probe.')
 
-    cache_dir = os.path.join(model_folder, WINDOW_CACHE_DIRNAME)
+    internal_split = None
+    cache_source_records = pretrain_records
+    probe_train_records = probe_records
+    probe_val_records = None
+    probe_test_records = None
+    final_probe_train_records = probe_records
+
+    if INTERNAL_EXPERIMENT_MODE:
+        internal_split = create_internal_split(probe_records)
+        cache_source_records = (
+            internal_split['train']
+            + internal_split['val']
+            + internal_split['test']
+        )
+        probe_train_records = internal_split['train']
+        probe_val_records = internal_split['val']
+        probe_test_records = internal_split['test']
+        final_probe_train_records = (
+            probe_train_records + probe_val_records
+            if INTERNAL_REFIT_ON_TRAIN_VAL
+            else probe_train_records
+        )
+
+        if verbose:
+            print_internal_split_summary(internal_split)
+
+    cache_dir = get_window_cache_dir(
+        subject_records=cache_source_records,
+        data_folder=data_folder,
+        csv_path=csv_path,
+    )
 
     if verbose:
-        print('Caching preprocessed EEG windows...')
+        print('Preparing preprocessed EEG window cache...')
 
-    cached_records = cache_subject_windows(
-        subject_records=pretrain_records,
+    cached_records = maybe_load_window_cache(
+        subject_records=cache_source_records,
         cache_dir=cache_dir,
+        data_folder=data_folder,
         csv_path=csv_path,
         verbose=verbose,
     )
 
-    cached_pretrain_records = [record for record in cached_records if record['num_windows'] > 0]
-    cached_probe_records = [record for record in cached_pretrain_records if record['label'] is not None]
+    if cached_records is None:
+        cached_records = cache_subject_windows(
+            subject_records=cache_source_records,
+            cache_dir=cache_dir,
+            data_folder=data_folder,
+            csv_path=csv_path,
+            verbose=verbose,
+        )
+    elif verbose:
+        print(f'Reusing cached EEG windows from {cache_dir}')
+
+    if internal_split is not None:
+        cached_split = split_cached_records_by_split(cached_records)
+        cached_pretrain_records = [record for record in cached_split['train'] if record['num_windows'] > 0]
+        cached_probe_train_records = cached_pretrain_records
+        cached_probe_val_records = [record for record in cached_split['val'] if record['num_windows'] > 0]
+        cached_probe_test_records = [record for record in cached_split['test'] if record['num_windows'] > 0]
+        cached_final_probe_train_records = (
+            cached_probe_train_records + cached_probe_val_records
+            if INTERNAL_REFIT_ON_TRAIN_VAL
+            else cached_probe_train_records
+        )
+    else:
+        cached_pretrain_records = [record for record in cached_records if record['num_windows'] > 0]
+        cached_probe_train_records = [record for record in cached_pretrain_records if record['label'] is not None]
+        cached_probe_val_records = None
+        cached_probe_test_records = None
+        cached_final_probe_train_records = cached_probe_train_records
 
     if not cached_pretrain_records:
         raise RuntimeError('No cached EEG windows were available for pretraining.')
-    if not cached_probe_records:
+    if not cached_probe_train_records:
         raise RuntimeError('No labeled cached EEG windows were available for the linear probe.')
 
     device = get_torch_device()
@@ -152,6 +227,8 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
         subject_records=cached_pretrain_records,
         device=device,
         verbose=verbose,
+        probe_train_records=cached_probe_train_records if internal_split is not None else None,
+        probe_val_records=cached_probe_val_records if internal_split is not None else None,
     )
 
     if verbose:
@@ -159,7 +236,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
 
     features, labels = build_probe_dataset(
         encoder=encoder,
-        subject_records=cached_probe_records,
+        subject_records=cached_final_probe_train_records,
         device=device,
         verbose=verbose,
     )
@@ -176,8 +253,28 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
         },
     }
 
+    if internal_split is not None:
+        internal_metrics = evaluate_internal_split(
+            encoder=encoder,
+            classifier=classifier,
+            selection_train_records=cached_probe_train_records,
+            val_records=cached_probe_val_records,
+            test_records=cached_probe_test_records,
+            device=device,
+            final_probe_train_size=len(cached_final_probe_train_records),
+        )
+        save_internal_split_artifacts(
+            model_folder=model_folder,
+            cached_records=cached_records,
+            metrics=internal_metrics,
+        )
+
+        if verbose:
+            print_internal_metrics(internal_metrics)
+
     save_model(model_folder, model)
-    cleanup_window_cache(cache_dir)
+    if not KEEP_LOCAL_WINDOW_CACHE:
+        cleanup_window_cache(cache_dir)
 
     if verbose:
         print(f'Pretrained on {len(cached_pretrain_records)} subjects.')
@@ -298,7 +395,14 @@ def collect_subject_records(data_folder):
     return subject_records
 
 
-def pretrain_window_encoder(encoder, subject_records, device, verbose):
+def pretrain_window_encoder(
+    encoder,
+    subject_records,
+    device,
+    verbose,
+    probe_train_records=None,
+    probe_val_records=None,
+):
     predictor = JEPAPredictor(embed_dim=encoder.embed_dim).to(device)
     target_encoder = copy.deepcopy(encoder).to(device)
     target_encoder.eval()
@@ -314,6 +418,10 @@ def pretrain_window_encoder(encoder, subject_records, device, verbose):
     dataset = CachedEEGWindowDataset(subject_records)
     if len(dataset) == 0:
         raise RuntimeError('The cached pretraining dataset is empty.')
+
+    track_validation = bool(probe_train_records) and bool(probe_val_records)
+    best_val_auroc = None
+    best_encoder_state = None
 
     for epoch in range(PRETRAIN_EPOCHS):
         epoch_loss = 0.0
@@ -363,6 +471,33 @@ def pretrain_window_encoder(encoder, subject_records, device, verbose):
         if verbose and epoch_batches > 0:
             print(f'Epoch {epoch + 1} JEPA loss: {epoch_loss / epoch_batches:.4f}')
 
+        if track_validation:
+            _, val_metrics = fit_probe_and_evaluate(
+                encoder=encoder,
+                train_records=probe_train_records,
+                eval_records=probe_val_records,
+                device=device,
+            )
+
+            current_val_auroc = val_metrics['auroc']
+            if verbose:
+                print(
+                    f'Epoch {epoch + 1} val AUROC: {current_val_auroc:.4f} '
+                    f'| val AUPRC: {val_metrics["auprc"]:.4f}'
+                )
+
+            if best_val_auroc is None or current_val_auroc > best_val_auroc:
+                best_val_auroc = current_val_auroc
+                best_encoder_state = {
+                    key: value.detach().cpu().clone()
+                    for key, value in encoder.state_dict().items()
+                }
+
+                if verbose:
+                    print(f'New best validation AUROC at epoch {epoch + 1}: {best_val_auroc:.4f}')
+
+    if best_encoder_state is not None:
+        encoder.load_state_dict(best_encoder_state)
     encoder.eval()
 
 
@@ -485,6 +620,219 @@ def predict_positive_probability(classifier, features):
 
     return float(probabilities[int(positive_index[0])])
 
+
+def predict_positive_probabilities(classifier, features):
+    if not hasattr(classifier, 'predict_proba'):
+        return classifier.predict(features).astype(np.float32)
+
+    probabilities = classifier.predict_proba(features)
+    classes = np.asarray(getattr(classifier, 'classes_', np.arange(probabilities.shape[1])))
+    positive_index = np.where(classes == 1)[0]
+
+    if positive_index.size == 0:
+        return np.zeros(features.shape[0], dtype=np.float32)
+
+    return probabilities[:, int(positive_index[0])].astype(np.float32)
+
+
+def create_internal_split(subject_records):
+    validate_internal_split_fractions()
+
+    labels = np.asarray([int(record['label']) for record in subject_records], dtype=np.int64)
+    indices = np.arange(len(subject_records))
+
+    train_indices, temp_indices = train_test_split(
+        indices,
+        train_size=INTERNAL_TRAIN_FRACTION,
+        stratify=labels,
+        random_state=INTERNAL_SPLIT_SEED,
+    )
+
+    temp_labels = labels[temp_indices]
+    val_fraction_of_temp = INTERNAL_VAL_FRACTION / (INTERNAL_VAL_FRACTION + INTERNAL_TEST_FRACTION)
+
+    val_indices, test_indices = train_test_split(
+        temp_indices,
+        train_size=val_fraction_of_temp,
+        stratify=temp_labels,
+        random_state=INTERNAL_SPLIT_SEED,
+    )
+
+    split_map = {
+        'train': sorted(train_indices.tolist()),
+        'val': sorted(val_indices.tolist()),
+        'test': sorted(test_indices.tolist()),
+    }
+
+    split_records = {}
+    for split_name, split_indices in split_map.items():
+        split_records[split_name] = [
+            dict(subject_records[index], split=split_name)
+            for index in split_indices
+        ]
+
+    return split_records
+
+
+def validate_internal_split_fractions():
+    fraction_sum = INTERNAL_TRAIN_FRACTION + INTERNAL_VAL_FRACTION + INTERNAL_TEST_FRACTION
+    if not np.isclose(fraction_sum, 1.0):
+        raise ValueError('Internal split fractions must sum to 1.0.')
+
+
+def print_internal_split_summary(split_records):
+    print('Using internal stratified split:')
+    for split_name in ('train', 'val', 'test'):
+        records = split_records[split_name]
+        labels = np.asarray([int(record['label']) for record in records], dtype=np.int64)
+        positives = int(np.sum(labels == 1))
+        negatives = int(np.sum(labels == 0))
+        print(
+            f'  {split_name}: {len(records)} subjects '
+            f'({negatives} healthy, {positives} impaired)'
+        )
+
+
+def split_cached_records_by_split(cached_records):
+    split_records = {'train': [], 'val': [], 'test': []}
+    for record in cached_records:
+        split_name = record.get('split')
+        if split_name in split_records:
+            split_records[split_name].append(record)
+    return split_records
+
+
+def fit_probe_and_evaluate(encoder, train_records, eval_records, device):
+    train_features, train_labels = build_probe_dataset(
+        encoder=encoder,
+        subject_records=train_records,
+        device=device,
+        verbose=False,
+    )
+    classifier = fit_linear_probe(train_features, train_labels)
+
+    eval_features, eval_labels = build_probe_dataset(
+        encoder=encoder,
+        subject_records=eval_records,
+        device=device,
+        verbose=False,
+    )
+
+    metrics = score_probe(classifier, eval_features, eval_labels)
+    return classifier, metrics
+
+
+def score_probe(classifier, features, labels):
+    probabilities = predict_positive_probabilities(classifier, features)
+    binary_predictions = classifier.predict(features)
+    unique_labels = np.unique(labels)
+
+    if unique_labels.size < 2:
+        auroc = float('nan')
+        auprc = float('nan')
+    else:
+        auroc = float(roc_auc_score(labels, probabilities))
+        auprc = float(average_precision_score(labels, probabilities))
+
+    metrics = {
+        'num_subjects': int(len(labels)),
+        'auroc': auroc,
+        'auprc': auprc,
+        'accuracy': float(accuracy_score(labels, binary_predictions)),
+        'f_measure': float(f1_score(labels, binary_predictions, pos_label=1, average='binary')),
+    }
+    return metrics
+
+
+def evaluate_internal_split(
+    encoder,
+    classifier,
+    selection_train_records,
+    val_records,
+    test_records,
+    device,
+    final_probe_train_size,
+):
+    metrics = {
+        'mode': 'internal_experiment',
+        'config': {
+            'pretrain_epochs': PRETRAIN_EPOCHS,
+            'embed_dim': EMBED_DIM,
+            'depth': TRANSFORMER_DEPTH,
+            'heads': TRANSFORMER_HEADS,
+        },
+        'split_sizes': {
+            'train': int(len(selection_train_records)),
+            'val': int(len(val_records)) if val_records is not None else 0,
+            'test': int(len(test_records)) if test_records is not None else 0,
+        },
+        'final_probe_train_size': int(final_probe_train_size),
+    }
+
+    if val_records:
+        _, val_metrics = fit_probe_and_evaluate(
+            encoder=encoder,
+            train_records=selection_train_records,
+            eval_records=val_records,
+            device=device,
+        )
+        metrics['val'] = val_metrics
+
+    if test_records:
+        test_features, test_labels = build_probe_dataset(
+            encoder=encoder,
+            subject_records=test_records,
+            device=device,
+            verbose=False,
+        )
+        metrics['test'] = score_probe(classifier, test_features, test_labels)
+
+    return metrics
+
+
+def save_internal_split_artifacts(model_folder, cached_records, metrics):
+    split_rows = []
+    for record in cached_records:
+        split_name = record.get('split')
+        if split_name is None:
+            continue
+        split_rows.append({
+            'patient_id': record['patient_id'],
+            'site_id': record['site_id'],
+            'session_id': record['session_id'],
+            'label': record['label'],
+            'split': split_name,
+            'num_windows': int(record.get('num_windows', 0)),
+        })
+
+    if split_rows:
+        split_df = pd.DataFrame(split_rows)
+        split_df.to_csv(os.path.join(model_folder, INTERNAL_SPLIT_FILENAME), index=False)
+
+    metrics_path = os.path.join(model_folder, INTERNAL_METRICS_FILENAME)
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics, f, indent=2)
+
+
+def print_internal_metrics(metrics):
+    val_metrics = metrics.get('val')
+    if val_metrics is not None:
+        print(
+            f'Internal val AUROC: {val_metrics["auroc"]:.4f} '
+            f'| AUPRC: {val_metrics["auprc"]:.4f} '
+            f'| Acc: {val_metrics["accuracy"]:.4f} '
+            f'| F1: {val_metrics["f_measure"]:.4f}'
+        )
+
+    test_metrics = metrics.get('test')
+    if test_metrics is not None:
+        print(
+            f'Internal test AUROC: {test_metrics["auroc"]:.4f} '
+            f'| AUPRC: {test_metrics["auprc"]:.4f} '
+            f'| Acc: {test_metrics["accuracy"]:.4f} '
+            f'| F1: {test_metrics["f_measure"]:.4f}'
+        )
+
 ################################################################################
 #
 # Raw EEG preprocessing and window extraction
@@ -509,10 +857,107 @@ def load_subject_windows(subject_record, csv_path):
     )
 
 
-def cache_subject_windows(subject_records, cache_dir, csv_path, verbose):
+def get_window_cache_dir(subject_records, data_folder, csv_path):
+    cache_descriptor = build_window_cache_descriptor(
+        subject_records=subject_records,
+        data_folder=data_folder,
+        csv_path=csv_path,
+    )
+    cache_key = hashlib.sha1(
+        json.dumps(cache_descriptor, sort_keys=True).encode('utf-8')
+    ).hexdigest()[:16]
+    return os.path.join(WINDOW_CACHE_ROOT, f'cache_{cache_key}')
+
+
+def build_window_cache_descriptor(subject_records, data_folder, csv_path):
+    return {
+        'version': WINDOW_CACHE_VERSION,
+        'data_folder': os.path.abspath(data_folder),
+        'csv_path': os.path.abspath(csv_path),
+        'channels': list(EEG_CHANNEL_ORDER),
+        'target_fs': TARGET_EEG_FS,
+        'window_seconds': WINDOW_SECONDS,
+        'window_size': WINDOW_SIZE,
+        'bandpass_low_hz': BANDPASS_LOW_HZ,
+        'bandpass_high_hz': BANDPASS_HIGH_HZ,
+        'filter_order': FILTER_ORDER,
+        'clip_percentile': ROBUST_CLIP_PERCENTILE,
+        'subjects': [
+            {
+                'patient_id': record['patient_id'],
+                'site_id': record['site_id'],
+                'session_id': record['session_id'],
+                'physiological_data_file': os.path.abspath(record['physiological_data_file']),
+                'label': record['label'],
+            }
+            for record in subject_records
+        ],
+    }
+
+
+def get_window_cache_manifest_path(cache_dir):
+    return os.path.join(cache_dir, WINDOW_CACHE_MANIFEST)
+
+
+def maybe_load_window_cache(subject_records, cache_dir, data_folder, csv_path, verbose):
+    if not REUSE_LOCAL_WINDOW_CACHE:
+        return None
+
+    manifest_path = get_window_cache_manifest_path(cache_dir)
+    if not os.path.isfile(manifest_path):
+        return None
+
+    try:
+        with open(manifest_path, 'r') as f:
+            manifest = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    expected_descriptor = build_window_cache_descriptor(
+        subject_records=subject_records,
+        data_folder=data_folder,
+        csv_path=csv_path,
+    )
+
+    if manifest.get('descriptor') != expected_descriptor:
+        if verbose:
+            print('Existing EEG cache does not match the current dataset/config. Rebuilding cache...')
+        return None
+
+    cached_records = manifest.get('cached_records', [])
+    if len(cached_records) != len(subject_records):
+        return None
+
+    for cached_record in cached_records:
+        num_windows = int(cached_record.get('num_windows', 0))
+        cache_path = cached_record.get('cache_path', '')
+        if num_windows > 0 and not os.path.isfile(cache_path):
+            return None
+
+    return cached_records
+
+
+def write_window_cache_manifest(cache_dir, descriptor, cached_records):
+    os.makedirs(cache_dir, exist_ok=True)
+    manifest_path = get_window_cache_manifest_path(cache_dir)
+    manifest = {
+        'descriptor': descriptor,
+        'cached_records': cached_records,
+    }
+    with open(manifest_path, 'w') as f:
+        json.dump(manifest, f)
+
+
+def cache_subject_windows(subject_records, cache_dir, data_folder, csv_path, verbose):
     if os.path.isdir(cache_dir):
         shutil.rmtree(cache_dir)
     os.makedirs(cache_dir, exist_ok=True)
+
+    cache_descriptor = build_window_cache_descriptor(
+        subject_records=subject_records,
+        data_folder=data_folder,
+        csv_path=csv_path,
+    )
 
     cached_records = []
     iterator = tqdm(
@@ -545,6 +990,12 @@ def cache_subject_windows(subject_records, cache_dir, csv_path, verbose):
 
         if verbose:
             iterator.set_postfix({'windows': total_windows})
+
+    write_window_cache_manifest(
+        cache_dir=cache_dir,
+        descriptor=cache_descriptor,
+        cached_records=cached_records,
+    )
 
     return cached_records
 
