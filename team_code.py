@@ -33,9 +33,10 @@ from fractions import Fraction
 from functools import lru_cache
 from scipy import signal
 from sklearn.dummy import DummyClassifier
+from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, average_precision_score, f1_score, roc_auc_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
@@ -77,6 +78,9 @@ BANDPASS_HIGH_HZ = 49.0
 FILTER_ORDER = 4
 ROBUST_CLIP_PERCENTILE = 99.5
 
+DELTA_BAND = (0.5, 4.0)
+THETA_BAND = (4.0, 8.0)
+
 PATCH_SIZE = 16
 EMBED_DIM = int(os.environ.get('PN2026_EMBED_DIM', '256'))
 TRANSFORMER_DEPTH = int(os.environ.get('PN2026_TRANSFORMER_DEPTH', '8'))
@@ -93,6 +97,29 @@ PRETRAIN_WEIGHT_DECAY = 1e-4
 TARGET_EMA = 0.996
 MAX_GRAD_NORM = 1.0
 PRETRAIN_NUM_WORKERS = 0
+
+USE_HYBRID_AUX_FEATURES = os.environ.get('PN2026_USE_HYBRID_AUX_FEATURES', '1').strip().lower() in ('1', 'true', 'yes', 'y')
+AUXILIARY_FEATURE_NAMES = (
+    'eeg_f3_m2_delta_theta_ratio',
+    'eeg_c3_m2_delta_theta_ratio',
+    'eeg_f4_m1_delta_theta_ratio',
+    'eeg_c4_m1_delta_theta_ratio',
+    'algo_prob_arous_mean',
+    'algo_arousal_index',
+)
+
+PROBE_MODEL_TYPE = os.environ.get('PN2026_PROBE_MODEL_TYPE', 'weighted_mlp').strip().lower()
+PROBE_POS_WEIGHT_CANDIDATES = tuple(float(value) for value in os.environ.get('PN2026_PROBE_POS_WEIGHTS', '1.0').split(','))
+PROBE_MLP_HIDDEN_DIMS = tuple(
+    int(value) for value in os.environ.get('PN2026_PROBE_MLP_HIDDEN_DIMS', '64,16').split(',') if value.strip()
+)
+PROBE_MLP_DROPOUT = float(os.environ.get('PN2026_PROBE_MLP_DROPOUT', '0.25'))
+PROBE_MLP_LR = float(os.environ.get('PN2026_PROBE_MLP_LR', '1e-3'))
+PROBE_MLP_WEIGHT_DECAY = float(os.environ.get('PN2026_PROBE_MLP_WEIGHT_DECAY', '1e-4'))
+PROBE_MLP_BATCH_SIZE = int(os.environ.get('PN2026_PROBE_MLP_BATCH_SIZE', '64'))
+PROBE_MLP_MAX_EPOCHS = int(os.environ.get('PN2026_PROBE_MLP_MAX_EPOCHS', '80'))
+PROBE_MLP_PATIENCE = int(os.environ.get('PN2026_PROBE_MLP_PATIENCE', '10'))
+PROBE_MLP_CV_FOLDS = int(os.environ.get('PN2026_PROBE_MLP_CV_FOLDS', '3'))
 
 WINDOW_CACHE_DIRNAME = 'window_cache'
 WINDOW_CACHE_ROOT = os.path.join(SCRIPT_DIR, '.window_cache')
@@ -192,6 +219,9 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
     elif verbose:
         print(f'Reusing cached EEG windows from {cache_dir}')
 
+    if USE_HYBRID_AUX_FEATURES:
+        attach_auxiliary_features_to_records(cached_records, verbose=verbose)
+
     if internal_split is not None:
         cached_split = split_cached_records_by_split(cached_records)
         cached_pretrain_records = [record for record in cached_split['train'] if record['num_windows'] > 0]
@@ -247,6 +277,8 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
         'classifier': classifier,
         'csv_path': os.path.abspath(csv_path),
         'encoder_config': get_encoder_config(),
+        'use_hybrid_aux_features': bool(USE_HYBRID_AUX_FEATURES),
+        'auxiliary_feature_names': list(AUXILIARY_FEATURE_NAMES) if USE_HYBRID_AUX_FEATURES else [],
         'encoder_state_dict': {
             key: value.detach().cpu()
             for key, value in encoder.state_dict().items()
@@ -316,6 +348,7 @@ def run_model(model, record, data_folder, verbose):
     classifier = model['classifier']
     csv_path = model.get('csv_path', DEFAULT_CSV_PATH)
     device = model['device']
+    use_hybrid_aux_features = bool(model.get('use_hybrid_aux_features', False))
 
     patient_id = record[HEADERS['bids_folder']]
     site_id = record[HEADERS['site_id']]
@@ -327,8 +360,15 @@ def run_model(model, record, data_folder, verbose):
         site_id,
         f'{patient_id}_ses-{session_id}.edf',
     )
+    algorithmic_annotations_file = os.path.join(
+        data_folder,
+        ALGORITHMIC_ANNOTATIONS_SUBFOLDER,
+        site_id,
+        f'{patient_id}_ses-{session_id}_caisr_annotations.edf',
+    )
 
-    subject_embedding = np.zeros(EMBED_DIM, dtype=np.float32)
+    subject_embedding = np.zeros(encoder.embed_dim, dtype=np.float32)
+    auxiliary_features = build_empty_auxiliary_feature_vector()
 
     if os.path.exists(physiological_data_file):
         physiological_data, physiological_fs = load_signal_data(physiological_data_file)
@@ -344,10 +384,20 @@ def run_model(model, record, data_folder, verbose):
                 device=device,
                 batch_size=PROBE_BATCH_SIZE,
             )
+            if use_hybrid_aux_features:
+                auxiliary_features = compute_auxiliary_features_from_windows_and_file(
+                    windows=windows,
+                    algorithmic_annotations_file=algorithmic_annotations_file,
+                )
+    elif use_hybrid_aux_features:
+        auxiliary_features = compute_auxiliary_features_from_algorithmic_file(
+            algorithmic_annotations_file=algorithmic_annotations_file,
+        )
 
-    subject_embedding = subject_embedding.reshape(1, -1)
-    binary_output = int(classifier.predict(subject_embedding)[0])
-    probability_output = predict_positive_probability(classifier, subject_embedding)
+    subject_features = build_subject_feature_vector(subject_embedding, auxiliary_features, use_hybrid_aux_features)
+    subject_features = subject_features.reshape(1, -1)
+    binary_output = int(classifier.predict(subject_features)[0])
+    probability_output = predict_positive_probability(classifier, subject_features)
 
     return binary_output, probability_output
 
@@ -388,6 +438,12 @@ def collect_subject_records(data_folder):
             'site_id': site_id,
             'session_id': session_id,
             'physiological_data_file': physiological_data_file,
+            'algorithmic_annotations_file': os.path.join(
+                data_folder,
+                ALGORITHMIC_ANNOTATIONS_SUBFOLDER,
+                site_id,
+                f'{patient_id}_ses-{session_id}_caisr_annotations.edf',
+            ),
             'has_eeg': has_eeg,
             'label': label,
         })
@@ -557,8 +613,14 @@ def build_probe_dataset(encoder, subject_records, device, verbose):
             device=device,
             batch_size=PROBE_BATCH_SIZE,
         )
+        auxiliary_features = get_cached_record_auxiliary_features(subject_record)
+        subject_features = build_subject_feature_vector(
+            subject_embedding=subject_embedding,
+            auxiliary_features=auxiliary_features,
+            use_hybrid_aux_features=USE_HYBRID_AUX_FEATURES,
+        )
 
-        features.append(subject_embedding)
+        features.append(subject_features)
         labels.append(int(subject_record['label']))
 
     if not features:
@@ -588,6 +650,12 @@ def compute_subject_embedding(encoder, windows, device, batch_size):
 
 
 def fit_linear_probe(features, labels):
+    if PROBE_MODEL_TYPE == 'weighted_mlp':
+        return fit_weighted_mlp_probe(features, labels)
+    return fit_logistic_probe(features, labels)
+
+
+def fit_logistic_probe(features, labels):
     unique_labels = np.unique(labels)
     if unique_labels.size < 2:
         classifier = DummyClassifier(strategy='constant', constant=int(unique_labels[0]))
@@ -595,6 +663,7 @@ def fit_linear_probe(features, labels):
         return classifier
 
     classifier = Pipeline([
+        ('imputer', SimpleImputer(strategy='median', keep_empty_features=True)),
         ('scaler', StandardScaler()),
         ('classifier', LogisticRegression(
             class_weight='balanced',
@@ -605,6 +674,485 @@ def fit_linear_probe(features, labels):
     ])
     classifier.fit(features, labels)
     return classifier
+
+
+def fit_weighted_mlp_probe(features, labels, val_features=None, val_labels=None, verbose=False):
+    features = np.asarray(features, dtype=np.float32)
+    labels = np.asarray(labels, dtype=np.int64)
+
+    if np.unique(labels).size < 2:
+        classifier = DummyClassifier(strategy='constant', constant=int(labels[0]))
+        classifier.fit(features, labels)
+        return classifier
+
+    if val_features is not None and val_labels is not None and len(val_labels) > 0:
+        selected_pos_weight, selected_epochs = select_weighted_mlp_hyperparameters_with_validation(
+            train_features=features,
+            train_labels=labels,
+            val_features=np.asarray(val_features, dtype=np.float32),
+            val_labels=np.asarray(val_labels, dtype=np.int64),
+            verbose=verbose,
+        )
+    else:
+        selected_pos_weight, selected_epochs = select_weighted_mlp_hyperparameters_with_cv(
+            features=features,
+            labels=labels,
+            verbose=verbose,
+        )
+
+    classifier = TorchMLPProbe(
+        input_dim=features.shape[1],
+        hidden_dims=PROBE_MLP_HIDDEN_DIMS,
+        dropout=PROBE_MLP_DROPOUT,
+    )
+    classifier.fit(
+        features=features,
+        labels=labels,
+        pos_weight=selected_pos_weight,
+        max_epochs=selected_epochs,
+        patience=max(PROBE_MLP_PATIENCE, selected_epochs),
+        verbose=verbose,
+    )
+    return classifier
+
+
+def select_weighted_mlp_hyperparameters_with_validation(train_features, train_labels, val_features, val_labels, verbose):
+    best_choice = None
+    best_score = None
+
+    for pos_weight in PROBE_POS_WEIGHT_CANDIDATES:
+        classifier = TorchMLPProbe(
+            input_dim=train_features.shape[1],
+            hidden_dims=PROBE_MLP_HIDDEN_DIMS,
+            dropout=PROBE_MLP_DROPOUT,
+        )
+        classifier.fit(
+            features=train_features,
+            labels=train_labels,
+            pos_weight=pos_weight,
+            val_features=val_features,
+            val_labels=val_labels,
+            max_epochs=PROBE_MLP_MAX_EPOCHS,
+            patience=PROBE_MLP_PATIENCE,
+            verbose=verbose,
+        )
+
+        metrics = score_probe(classifier, val_features, val_labels)
+        score = (
+            nan_safe_metric(metrics['auroc']),
+            nan_safe_metric(metrics['auprc']),
+            -abs(pos_weight - 1.0),
+        )
+        if best_score is None or score > best_score:
+            best_score = score
+            best_choice = (float(pos_weight), int(classifier.best_epoch))
+
+    return best_choice
+
+
+def select_weighted_mlp_hyperparameters_with_cv(features, labels, verbose):
+    if len(labels) < 20 or np.min(np.bincount(labels)) < PROBE_MLP_CV_FOLDS:
+        return float(PROBE_POS_WEIGHT_CANDIDATES[0]), int(PROBE_MLP_MAX_EPOCHS)
+
+    splitter = StratifiedKFold(
+        n_splits=min(PROBE_MLP_CV_FOLDS, int(np.min(np.bincount(labels)))),
+        shuffle=True,
+        random_state=RANDOM_STATE,
+    )
+
+    best_choice = None
+    best_score = None
+
+    for pos_weight in PROBE_POS_WEIGHT_CANDIDATES:
+        fold_aurocs = []
+        fold_auprcs = []
+        fold_epochs = []
+
+        for train_index, val_index in splitter.split(features, labels):
+            classifier = TorchMLPProbe(
+                input_dim=features.shape[1],
+                hidden_dims=PROBE_MLP_HIDDEN_DIMS,
+                dropout=PROBE_MLP_DROPOUT,
+            )
+            classifier.fit(
+                features=features[train_index],
+                labels=labels[train_index],
+                pos_weight=pos_weight,
+                val_features=features[val_index],
+                val_labels=labels[val_index],
+                max_epochs=PROBE_MLP_MAX_EPOCHS,
+                patience=PROBE_MLP_PATIENCE,
+                verbose=False,
+            )
+            metrics = score_probe(classifier, features[val_index], labels[val_index])
+            fold_aurocs.append(metrics['auroc'])
+            fold_auprcs.append(metrics['auprc'])
+            fold_epochs.append(classifier.best_epoch)
+
+        score = (
+            nan_safe_metric(np.nanmean(fold_aurocs)),
+            nan_safe_metric(np.nanmean(fold_auprcs)),
+            -abs(pos_weight - 1.0),
+        )
+        if verbose:
+            print(
+                f'CV pos_weight={pos_weight:.2f} '
+                f'| AUROC={np.nanmean(fold_aurocs):.4f} '
+                f'| AUPRC={np.nanmean(fold_auprcs):.4f} '
+                f'| epochs={int(round(np.mean(fold_epochs)))}'
+            )
+        if best_score is None or score > best_score:
+            best_score = score
+            best_choice = (
+                float(pos_weight),
+                max(1, int(round(float(np.mean(fold_epochs))))),
+            )
+
+    return best_choice
+
+
+def nan_safe_metric(value):
+    value = float(value)
+    return value if np.isfinite(value) else -1.0
+
+
+class ProbeMLPNetwork(TorchModuleBase):
+    def __init__(self, input_dim, hidden_dims, dropout):
+        super().__init__()
+
+        layers = []
+        current_dim = int(input_dim)
+
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(current_dim, int(hidden_dim)))
+            layers.append(nn.GELU())
+            layers.append(nn.Dropout(float(dropout)))
+            current_dim = int(hidden_dim)
+
+        layers.append(nn.Linear(current_dim, 1))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, features):
+        return self.network(features).squeeze(-1)
+
+
+class TorchMLPProbe:
+    def __init__(self, input_dim, hidden_dims, dropout):
+        self.input_dim = int(input_dim)
+        self.hidden_dims = tuple(int(value) for value in hidden_dims)
+        self.dropout = float(dropout)
+        self.imputer = SimpleImputer(strategy='median', keep_empty_features=True)
+        self.scaler = StandardScaler()
+        self.classes_ = np.asarray([0, 1], dtype=np.int64)
+        self.state_dict = None
+        self.pos_weight = 1.0
+        self.best_epoch = 0
+        self.max_epochs = 0
+
+    def fit(
+        self,
+        features,
+        labels,
+        pos_weight,
+        val_features=None,
+        val_labels=None,
+        max_epochs=PROBE_MLP_MAX_EPOCHS,
+        patience=PROBE_MLP_PATIENCE,
+        verbose=False,
+    ):
+        require_torch()
+        set_random_seed(RANDOM_STATE)
+
+        train_features = self.imputer.fit_transform(np.asarray(features, dtype=np.float32))
+        train_features = self.scaler.fit_transform(train_features).astype(np.float32, copy=False)
+        train_labels = np.asarray(labels, dtype=np.float32)
+
+        if val_features is not None and val_labels is not None:
+            val_features = self.imputer.transform(np.asarray(val_features, dtype=np.float32))
+            val_features = self.scaler.transform(val_features).astype(np.float32, copy=False)
+            val_labels = np.asarray(val_labels, dtype=np.float32)
+        else:
+            val_features = None
+            val_labels = None
+
+        device = get_torch_device()
+        network = ProbeMLPNetwork(
+            input_dim=self.input_dim,
+            hidden_dims=self.hidden_dims,
+            dropout=self.dropout,
+        ).to(device)
+
+        optimizer = torch.optim.AdamW(
+            network.parameters(),
+            lr=PROBE_MLP_LR,
+            weight_decay=PROBE_MLP_WEIGHT_DECAY,
+        )
+        criterion = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor(float(pos_weight), dtype=torch.float32, device=device)
+        )
+
+        train_feature_tensor = torch.from_numpy(train_features)
+        train_label_tensor = torch.from_numpy(train_labels)
+
+        if val_features is not None:
+            val_feature_tensor = torch.from_numpy(val_features).to(device=device, dtype=torch.float32)
+            val_label_array = val_labels.astype(np.int64, copy=False)
+        else:
+            val_feature_tensor = None
+            val_label_array = None
+
+        batch_size = min(PROBE_MLP_BATCH_SIZE, max(1, train_features.shape[0]))
+        best_state_dict = None
+        best_epoch = 0
+        best_score = None
+        patience_counter = 0
+
+        for epoch in range(int(max_epochs)):
+            network.train()
+            permutation = torch.randperm(train_feature_tensor.shape[0])
+
+            epoch_loss = 0.0
+            epoch_batches = 0
+            for batch_start in range(0, train_feature_tensor.shape[0], batch_size):
+                batch_indices = permutation[batch_start:batch_start + batch_size]
+                batch_features = train_feature_tensor[batch_indices].to(device=device, dtype=torch.float32)
+                batch_labels = train_label_tensor[batch_indices].to(device=device, dtype=torch.float32)
+
+                optimizer.zero_grad(set_to_none=True)
+                logits = network(batch_features)
+                loss = criterion(logits, batch_labels)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(network.parameters(), MAX_GRAD_NORM)
+                optimizer.step()
+
+                epoch_loss += float(loss.detach().cpu())
+                epoch_batches += 1
+
+            if val_feature_tensor is not None:
+                val_probabilities = self._predict_probabilities_from_network(network, val_feature_tensor)
+                if np.unique(val_label_array).size < 2:
+                    val_auroc = float('nan')
+                    val_auprc = float('nan')
+                else:
+                    val_auroc = float(roc_auc_score(val_label_array, val_probabilities))
+                    val_auprc = float(average_precision_score(val_label_array, val_probabilities))
+                score = (
+                    nan_safe_metric(val_auroc),
+                    nan_safe_metric(val_auprc),
+                    -float(epoch + 1),
+                )
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_epoch = epoch + 1
+                    best_state_dict = {
+                        key: value.detach().cpu().clone()
+                        for key, value in network.state_dict().items()
+                    }
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= int(patience):
+                        break
+            else:
+                best_epoch = epoch + 1
+                best_state_dict = {
+                    key: value.detach().cpu().clone()
+                    for key, value in network.state_dict().items()
+                }
+
+            if verbose and (epoch == 0 or (epoch + 1) % 10 == 0):
+                mean_loss = epoch_loss / max(epoch_batches, 1)
+                if val_feature_tensor is not None and best_score is not None:
+                    print(
+                        f'Probe epoch {epoch + 1}/{max_epochs} '
+                        f'| loss={mean_loss:.4f} '
+                        f'| best_val_auroc={best_score[0]:.4f}'
+                    )
+                else:
+                    print(f'Probe epoch {epoch + 1}/{max_epochs} | loss={mean_loss:.4f}')
+
+        self.state_dict = best_state_dict
+        self.pos_weight = float(pos_weight)
+        self.best_epoch = int(best_epoch)
+        self.max_epochs = int(max_epochs)
+        return self
+
+    def _build_network(self):
+        require_torch()
+        network = ProbeMLPNetwork(
+            input_dim=self.input_dim,
+            hidden_dims=self.hidden_dims,
+            dropout=self.dropout,
+        )
+        if self.state_dict is None:
+            raise RuntimeError('The MLP probe has not been fit yet.')
+        network.load_state_dict(self.state_dict)
+        network.eval()
+        return network
+
+    def _prepare_features(self, features):
+        features = self.imputer.transform(np.asarray(features, dtype=np.float32))
+        features = self.scaler.transform(features).astype(np.float32, copy=False)
+        return features
+
+    def _predict_probabilities_from_network(self, network, feature_tensor):
+        network.eval()
+        with torch.no_grad():
+            logits = network(feature_tensor)
+            probabilities = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32, copy=False)
+        return probabilities
+
+    def predict_proba(self, features):
+        prepared_features = self._prepare_features(features)
+        feature_tensor = torch.from_numpy(prepared_features)
+        network = self._build_network()
+        probabilities = self._predict_probabilities_from_network(network, feature_tensor)
+        return np.column_stack([1.0 - probabilities, probabilities]).astype(np.float32, copy=False)
+
+    def predict(self, features):
+        positive_probabilities = self.predict_proba(features)[:, 1]
+        return (positive_probabilities >= 0.5).astype(np.int64)
+
+
+def build_subject_feature_vector(subject_embedding, auxiliary_features, use_hybrid_aux_features):
+    subject_embedding = np.asarray(subject_embedding, dtype=np.float32).reshape(-1)
+    if not use_hybrid_aux_features:
+        return subject_embedding
+
+    auxiliary_features = np.asarray(auxiliary_features, dtype=np.float32).reshape(-1)
+    return np.concatenate([subject_embedding, auxiliary_features]).astype(np.float32, copy=False)
+
+
+def attach_auxiliary_features_to_records(subject_records, verbose):
+    iterator = tqdm(
+        subject_records,
+        desc='Aux Features',
+        unit='subject',
+        disable=not verbose,
+    )
+
+    for subject_record in iterator:
+        windows = load_cached_subject_windows(subject_record)
+        subject_record['auxiliary_features'] = compute_auxiliary_features_from_windows_and_file(
+            windows=windows,
+            algorithmic_annotations_file=subject_record.get('algorithmic_annotations_file'),
+        ).tolist()
+
+
+def get_cached_record_auxiliary_features(subject_record):
+    auxiliary_features = subject_record.get('auxiliary_features')
+    if auxiliary_features is None:
+        return build_empty_auxiliary_feature_vector()
+    return np.asarray(auxiliary_features, dtype=np.float32)
+
+
+def build_empty_auxiliary_feature_vector():
+    return np.full(len(AUXILIARY_FEATURE_NAMES), np.nan, dtype=np.float32)
+
+
+def compute_auxiliary_features_from_windows_and_file(windows, algorithmic_annotations_file):
+    features = build_empty_auxiliary_feature_vector()
+
+    if windows is not None and windows.size > 0:
+        features[:4] = compute_top_eeg_ratio_features_from_windows(windows)
+
+    algorithmic_features = compute_auxiliary_features_from_algorithmic_file(algorithmic_annotations_file)
+    features[4:] = algorithmic_features[4:]
+    return features
+
+
+def compute_top_eeg_ratio_features_from_windows(windows):
+    windows = np.asarray(windows, dtype=np.float32)
+    ratio_features = np.full(4, np.nan, dtype=np.float32)
+    channel_indices = [0, 2, 1, 3]
+
+    for feature_index, channel_index in enumerate(channel_indices):
+        if channel_index >= windows.shape[1]:
+            continue
+
+        lead_values = windows[:, channel_index, :].reshape(-1)
+        if lead_values.size < 32:
+            continue
+        if not np.any(np.abs(lead_values) > 1e-8):
+            continue
+
+        band_powers = compute_band_powers(lead_values, TARGET_EEG_FS)
+        theta_power = band_powers['theta']
+        delta_power = band_powers['delta']
+        if not np.isfinite(theta_power) or theta_power <= 0 or not np.isfinite(delta_power):
+            continue
+
+        ratio_features[feature_index] = float(delta_power / theta_power)
+
+    return ratio_features
+
+
+def compute_auxiliary_features_from_algorithmic_file(algorithmic_annotations_file):
+    features = build_empty_auxiliary_feature_vector()
+
+    if not algorithmic_annotations_file or not os.path.exists(algorithmic_annotations_file):
+        return features
+
+    try:
+        algorithmic_annotations, _ = load_signal_data(algorithmic_annotations_file)
+    except Exception:
+        return features
+
+    features[4] = compute_mean_probability_feature(
+        algorithmic_annotations.get('caisr_prob_arous', []),
+    )
+    features[5] = compute_event_index_feature(
+        algorithmic_annotations.get('arousal_caisr', []),
+    )
+    return features
+
+
+def compute_mean_probability_feature(values):
+    values = np.asarray(values, dtype=np.float32)
+    if values.size == 0:
+        return np.nan
+
+    valid_values = values[(values >= 0.0) & (values <= 1.0)]
+    if valid_values.size == 0:
+        return np.nan
+
+    return float(np.mean(valid_values))
+
+
+def compute_event_index_feature(values):
+    values = np.asarray(values, dtype=np.float32)
+    if values.size == 0:
+        return np.nan
+
+    total_hours = values.size / 3600.0
+    if total_hours <= 0:
+        return np.nan
+
+    binary_values = (values > 0).astype(np.int8)
+    event_starts = np.diff(binary_values, prepend=0)
+    return float(np.count_nonzero(event_starts == 1) / total_hours)
+
+
+def compute_band_powers(signal_array, sampling_frequency):
+    signal_array = np.asarray(signal_array, dtype=np.float32).reshape(-1)
+    if signal_array.size == 0:
+        return {'delta': np.nan, 'theta': np.nan}
+
+    sampling_frequency = float(sampling_frequency)
+    frequencies = np.fft.rfftfreq(signal_array.size, d=1.0 / sampling_frequency)
+    fft_values = np.abs(np.fft.rfft(signal_array))
+    power_spectral_density = (fft_values ** 2) / (signal_array.size * sampling_frequency)
+
+    def integrate_band(low_hz, high_hz):
+        band_mask = (frequencies >= low_hz) & (frequencies < high_hz)
+        if not np.any(band_mask):
+            return np.nan
+        return float(np.trapezoid(power_spectral_density[band_mask], frequencies[band_mask]))
+
+    return {
+        'delta': integrate_band(*DELTA_BAND),
+        'theta': integrate_band(*THETA_BAND),
+    }
 
 
 def predict_positive_probability(classifier, features):
@@ -709,7 +1257,6 @@ def fit_probe_and_evaluate(encoder, train_records, eval_records, device):
         device=device,
         verbose=False,
     )
-    classifier = fit_linear_probe(train_features, train_labels)
 
     eval_features, eval_labels = build_probe_dataset(
         encoder=encoder,
@@ -717,6 +1264,17 @@ def fit_probe_and_evaluate(encoder, train_records, eval_records, device):
         device=device,
         verbose=False,
     )
+
+    if PROBE_MODEL_TYPE == 'weighted_mlp':
+        classifier = fit_weighted_mlp_probe(
+            train_features,
+            train_labels,
+            val_features=eval_features,
+            val_labels=eval_labels,
+            verbose=False,
+        )
+    else:
+        classifier = fit_linear_probe(train_features, train_labels)
 
     metrics = score_probe(classifier, eval_features, eval_labels)
     return classifier, metrics

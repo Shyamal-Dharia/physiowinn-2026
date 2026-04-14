@@ -12,3 +12,6 @@ scores.txt
 .window_cache
 model_exp_a
 model_exp_b
+model_hybrid_jepa_128e2
+analysis/
+feature_audit.py
