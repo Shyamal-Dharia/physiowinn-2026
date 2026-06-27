@@ -1,0 +1,9 @@
+AGENTS.md
+
+dataset/
+eeg_cache/
+eeg_*.pt
+eeg_cv_results.json
+.venv/
+__pycache__/
+*.pyc
