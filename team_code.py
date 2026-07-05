@@ -46,6 +46,10 @@ EEG_NUM_WINDOWS = 300
 CNN_EPOCHS = 50
 CNN_BATCH_SIZE = 512
 CNN_MODEL_FILE = 'cnn_model.pt'
+JEPA_MSE_WEIGHT = 0.1
+SIGREG_WEIGHT = 0.1
+EEG_VIEW_NOISE_STD = 0.02
+EEG_VIEW_CHANNEL_DROP = 0.1
 
 ################################################################################
 #
@@ -125,10 +129,10 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
 
     labels = np.load(os.path.join(cache_folder, 'y.npy')).astype(np.int8)
     ages = load_cache_subject_ages(cache_folder, data_folder)
-    best = max(history, key=lambda row: row.get('reward_best', row.get('average_precision', -np.inf)))
+    best = max(history, key=lambda row: row.get('reward_prevalence', row.get('average_precision', -np.inf)))
     checkpoint = {
         'model_state_dict': model.state_dict(),
-        'threshold_scale': float(best.get('reward_best_scale', 1.0)),
+        'pos_weight': float(best.get('pos_weight', 1.0)),
         'prevalence_labels': labels,
         'prevalence_ages': ages,
         'fallback_prevalence': float(labels.mean()),
@@ -177,33 +181,42 @@ def run_model(model, record, data_folder, verbose):
         model['prevalence_ages'],
         fallback=model['fallback_prevalence'],
     )
+    if not np.isfinite(prevalence):
+        prevalence = float(model['fallback_prevalence'])
+    prevalence = float(np.clip(prevalence, 1e-6, 1 - 1e-6))
 
+    probability_output = prevalence
     edf_path = os.path.join(data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}.edf")
-    if not os.path.exists(edf_path):
-        probability_output = prevalence
-    else:
-        eeg_signals, fs = load_eeg_signals(
-            edf_path,
-            channels=tuple(model['channels']),
-            target_fs=model['target_fs'],
-            bandpass=tuple(model['bandpass']) if model['bandpass'] is not None else None,
-        )
-        windows = sample_eeg_windows(
-            eeg_signals,
-            fs,
-            num_windows=int(model['num_windows']),
-            channels=tuple(model['channels']),
-            rng=0,
-        )
-        if windows.shape != (int(model['num_windows']), len(model['channels']), int(round(EEG_SEGMENT_SECONDS * model['target_fs']))):
-            probability_output = prevalence
-        else:
-            windows = (windows - windows.mean(axis=-1, keepdims=True)) / (windows.std(axis=-1, keepdims=True) + 1e-6)
-            with torch.no_grad():
-                x = torch.from_numpy(windows.astype(np.float32, copy=False))
-                probability_output = float(torch.sigmoid(model['model'](x)).mean().item())
+    if os.path.exists(edf_path):
+        try:
+            eeg_signals, fs = load_eeg_signals(
+                edf_path,
+                channels=tuple(model['channels']),
+                target_fs=model['target_fs'],
+                bandpass=tuple(model['bandpass']) if model['bandpass'] is not None else None,
+            )
+            windows = sample_eeg_windows(
+                eeg_signals,
+                fs,
+                num_windows=int(model['num_windows']),
+                channels=tuple(model['channels']),
+                rng=0,
+            )
+            if windows.shape == (int(model['num_windows']), len(model['channels']), int(round(EEG_SEGMENT_SECONDS * model['target_fs']))):
+                windows = (windows - windows.mean(axis=-1, keepdims=True)) / (windows.std(axis=-1, keepdims=True) + 1e-6)
+                with torch.no_grad():
+                    x = torch.from_numpy(windows.astype(np.float32, copy=False))
+                    window_probs = torch.sigmoid(model['model'](x)).flatten()
+                    window_probs = calibrate_pos_weighted_probabilities(window_probs, model.get('pos_weight', 1.0))
+                    probability_output = float(window_probs.mean().item())
+        except Exception as exc:
+            if verbose:
+                print(f'EEG inference failed for {patient_id}: {exc}')
 
-    threshold = np.clip(prevalence * float(model['threshold_scale']), 1e-6, 1 - 1e-6)
+    if not np.isfinite(probability_output):
+        probability_output = prevalence
+    probability_output = float(np.clip(probability_output, 0.0, 1.0))
+    threshold = prevalence
     binary_output = bool(probability_output > threshold)
     return binary_output, probability_output
 
@@ -645,10 +658,67 @@ def make_small_eeg_cnn():
         torch.nn.Conv1d(64, 128, kernel_size=7, stride=2, padding=3),
         torch.nn.BatchNorm1d(128),
         torch.nn.ReLU(),
-        torch.nn.AdaptiveAvgPool1d(1),
+        torch.nn.AdaptiveAvgPool1d(4),
         torch.nn.Flatten(),
-        torch.nn.Linear(128, 1),
+        torch.nn.Dropout(0.2),
+        torch.nn.Linear(128 * 4, 1),
     )
+
+
+def eeg_cnn_features(model, x):
+    return model[:-1](x)
+
+
+def sigreg_loss(x, sketch_dim=128):
+    import torch
+
+    n, c = x.size()
+    A = torch.randn(c, sketch_dim, device=x.device)
+    A = A / (A.norm(p=2, dim=0, keepdim=True) + 1e-6)
+    t = torch.linspace(-5, 5, 17, device=x.device)
+    exp_f = torch.exp(-0.5 * t**2)
+    proj = x @ A
+    args = proj.unsqueeze(2) * t.view(1, 1, -1)
+    ecf = torch.exp(1j * args).mean(dim=0)
+    diff_sq = (ecf - exp_f.unsqueeze(0)).abs().square()
+    err = diff_sq * exp_f.unsqueeze(0)
+    return (torch.trapz(err, t, dim=1)).mean()
+
+
+def make_eeg_view(x, noise_std=EEG_VIEW_NOISE_STD, channel_drop=EEG_VIEW_CHANNEL_DROP):
+    import torch
+
+    view = x + noise_std * torch.randn_like(x)
+    if channel_drop <= 0:
+        return view
+    keep = (torch.rand(x.shape[0], x.shape[1], 1, device=x.device) >= channel_drop).to(x.dtype)
+    return view * keep / max(1.0 - channel_drop, 1e-6)
+
+
+def compute_joint_eeg_loss(model, loss_fn, x, y, sample_weight=None, return_parts=False):
+    import torch
+
+    x1 = make_eeg_view(x)
+    x2 = make_eeg_view(x)
+    z = eeg_cnn_features(model, torch.cat([x, x1, x2], dim=0))
+    z_clean, z1, z2 = z.chunk(3, dim=0)
+    logits = model[-1](z_clean).flatten()
+    bce = loss_fn(logits, y)
+    bce = (bce * sample_weight).mean() if sample_weight is not None else bce.mean()
+
+    mse = torch.nn.functional.mse_loss(
+        torch.nn.functional.normalize(z1, dim=1),
+        torch.nn.functional.normalize(z2, dim=1),
+    )
+    sigreg = sigreg_loss(z)
+    loss = bce + JEPA_MSE_WEIGHT * mse + SIGREG_WEIGHT * sigreg
+    if return_parts:
+        return loss, {
+            'bce': float(bce.detach().cpu()),
+            'mse': float(mse.detach().cpu()),
+            'sigreg': float(sigreg.detach().cpu()),
+        }
+    return loss
 
 
 def compute_internal_reward_metrics(labels, probabilities, ages, prevalence_labels, prevalence_ages):
@@ -707,7 +777,15 @@ def estimate_age_prevalence(age, prevalence_labels, prevalence_ages, gap=2, fall
     return max(float(prevalence_labels[mask].sum()), 0.5) / int(mask.sum())
 
 
-def predict_eeg_subject_probabilities(model, val_loader, device=None):
+def calibrate_pos_weighted_probabilities(probabilities, pos_weight):
+    # ponytail: undo weighted-BCE class prior shift; use a held-out calibrator if this stops tracking reward.
+    pos_weight = float(pos_weight)
+    if not np.isfinite(pos_weight) or pos_weight <= 0:
+        pos_weight = 1.0
+    return probabilities / (probabilities + pos_weight * (1 - probabilities))
+
+
+def predict_eeg_subject_probabilities(model, val_loader, device=None, pos_weight=1.0):
     import torch
 
     device = device or next(model.parameters()).device
@@ -718,17 +796,18 @@ def predict_eeg_subject_probabilities(model, val_loader, device=None):
         for x, y in val_loader:
             batch_size, num_windows, channels, time = x.shape
             x = x.reshape(batch_size * num_windows, channels, time).to(device)
-            window_probs = torch.sigmoid(model(x).reshape(batch_size, num_windows)).mean(dim=1)
+            window_probs = torch.sigmoid(model(x).reshape(batch_size, num_windows))
+            window_probs = calibrate_pos_weighted_probabilities(window_probs, pos_weight).mean(dim=1)
             probs.extend(window_probs.cpu().numpy().tolist())
             labels.extend(y.numpy().tolist())
 
     return np.asarray(labels, dtype=np.int8), np.asarray(probs, dtype=np.float32)
 
 
-def evaluate_eeg_baseline(model, val_loader, device=None, ages=None, prevalence_labels=None, prevalence_ages=None):
+def evaluate_eeg_baseline(model, val_loader, device=None, ages=None, prevalence_labels=None, prevalence_ages=None, pos_weight=1.0):
     from sklearn.metrics import average_precision_score, roc_auc_score
 
-    labels, probs = predict_eeg_subject_probabilities(model, val_loader, device=device)
+    labels, probs = predict_eeg_subject_probabilities(model, val_loader, device=device, pos_weight=pos_weight)
     metrics = {'positive_rate': float(labels.mean()), 'mean_probability': float(probs.mean())}
     if len(np.unique(labels)) == 2:
         metrics['auroc'] = float(roc_auc_score(labels, probs))
@@ -773,14 +852,17 @@ def cross_validate_eeg_baseline(cache_folder, data_folder, folds=5, epochs=5, ba
         model = make_small_eeg_cnn().to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
         if reward_weighted:
+            pos_weight_value = 1.0
             loss_fn = torch.nn.BCEWithLogitsLoss(reduction='none')
         else:
             pos_weight = torch.tensor([counts[0] / max(1, counts[1])], dtype=torch.float32, device=device)
-            loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            pos_weight_value = float(pos_weight.item())
+            loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction='none')
 
         for epoch in range(1, epochs + 1):
             model.train()
             losses = []
+            parts = []
             for batch in train_loader:
                 if reward_weighted:
                     x, yb, wb = batch
@@ -790,14 +872,15 @@ def cross_validate_eeg_baseline(cache_folder, data_folder, folds=5, epochs=5, ba
                 x = x.to(device)
                 yb = yb.to(device)
                 optimizer.zero_grad(set_to_none=True)
-                logits = model(x).flatten()
-                loss = (loss_fn(logits, yb) * wb).mean() if reward_weighted else loss_fn(logits, yb)
+                loss, batch_parts = compute_joint_eeg_loss(model, loss_fn, x, yb, wb if reward_weighted else None, return_parts=True)
                 loss.backward()
                 optimizer.step()
                 losses.append(float(loss.detach().cpu()))
+                parts.append(batch_parts)
 
-        val_labels, val_probs = predict_eeg_subject_probabilities(model, val_loader, device=device)
+        val_labels, val_probs = predict_eeg_subject_probabilities(model, val_loader, device=device, pos_weight=pos_weight_value)
         oof_probs[val_subjects] = val_probs
+        mean_parts = {key: float(np.mean([row[key] for row in parts])) for key in ('bce', 'mse', 'sigreg')}
         metrics = compute_internal_reward_metrics(
             val_labels,
             val_probs,
@@ -808,13 +891,20 @@ def cross_validate_eeg_baseline(cache_folder, data_folder, folds=5, epochs=5, ba
         metrics.update({
             'fold': fold,
             'train_loss': float(np.mean(losses)),
+            'train_bce_loss': mean_parts['bce'],
+            'train_mse_loss': mean_parts['mse'],
+            'train_sigreg_loss': mean_parts['sigreg'],
             'auroc': float(roc_auc_score(val_labels, val_probs)),
             'average_precision': float(average_precision_score(val_labels, val_probs)),
             'val_subjects': int(len(val_subjects)),
+            'pos_weight': pos_weight_value,
         })
         fold_metrics.append(metrics)
         print(
             f"fold={fold}/{folds} loss={metrics['train_loss']:.4f} "
+            f"bce={metrics['train_bce_loss']:.4f} "
+            f"mse={metrics['train_mse_loss']:.4f} "
+            f"sigreg={metrics['train_sigreg_loss']:.4f} "
             f"ap={metrics['average_precision']:.3f} auroc={metrics['auroc']:.3f} "
             f"reward={metrics['reward_prevalence']:.3f} "
             f"reward_best={metrics['reward_best']:.3f}"
@@ -877,10 +967,12 @@ def train_eeg_baseline(cache_folder, model_path=None, epochs=3, batch_size=128, 
     model = make_small_eeg_cnn().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     if reward_weighted:
+        pos_weight_value = 1.0
         loss_fn = torch.nn.BCEWithLogitsLoss(reduction='none')
     else:
         pos_weight = torch.tensor([counts[0] / max(1, counts[1])], dtype=torch.float32, device=device)
-        loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        pos_weight_value = float(pos_weight.item())
+        loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction='none')
     history = []
     best_score = -np.inf
     best_state = None
@@ -888,6 +980,7 @@ def train_eeg_baseline(cache_folder, model_path=None, epochs=3, batch_size=128, 
     for epoch in range(1, epochs + 1):
         model.train()
         losses = []
+        parts = []
         for batch in train_loader:
             if reward_weighted:
                 x, yb, wb = batch
@@ -897,17 +990,14 @@ def train_eeg_baseline(cache_folder, model_path=None, epochs=3, batch_size=128, 
             x = x.to(device)
             yb = yb.to(device)
             optimizer.zero_grad(set_to_none=True)
-            logits = model(x).flatten()
-            if reward_weighted:
-                loss = (loss_fn(logits, yb) * wb).mean()
-            else:
-                loss = loss_fn(logits, yb)
+            loss, batch_parts = compute_joint_eeg_loss(model, loss_fn, x, yb, wb if reward_weighted else None, return_parts=True)
             loss.backward()
             optimizer.step()
             losses.append(float(loss.detach().cpu()))
+            parts.append(batch_parts)
 
         if subject_ages is None:
-            metrics = evaluate_eeg_baseline(model, val_loader, device=device)
+            metrics = evaluate_eeg_baseline(model, val_loader, device=device, pos_weight=pos_weight_value)
         else:
             metrics = evaluate_eeg_baseline(
                 model,
@@ -916,18 +1006,31 @@ def train_eeg_baseline(cache_folder, model_path=None, epochs=3, batch_size=128, 
                 ages=subject_ages[val_subjects],
                 prevalence_labels=train_labels,
                 prevalence_ages=subject_ages[train_subjects],
+                pos_weight=pos_weight_value,
             )
-        metrics.update({'epoch': epoch, 'train_loss': float(np.mean(losses)), 'reward_weighted': reward_weighted})
+        mean_parts = {key: float(np.mean([row[key] for row in parts])) for key in ('bce', 'mse', 'sigreg')}
+        metrics.update({
+            'epoch': epoch,
+            'train_loss': float(np.mean(losses)),
+            'train_bce_loss': mean_parts['bce'],
+            'train_mse_loss': mean_parts['mse'],
+            'train_sigreg_loss': mean_parts['sigreg'],
+            'reward_weighted': reward_weighted,
+            'pos_weight': pos_weight_value,
+        })
         history.append(metrics)
-        score = metrics.get('reward_best', metrics.get('average_precision', -np.inf))
+        score = metrics.get('reward_prevalence', metrics.get('average_precision', -np.inf))
         if score > best_score:
             best_score = score
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         print(
             f"epoch={epoch} loss={metrics['train_loss']:.4f} "
+            f"bce={metrics['train_bce_loss']:.4f} "
+            f"mse={metrics['train_mse_loss']:.4f} "
+            f"sigreg={metrics['train_sigreg_loss']:.4f} "
             f"ap={metrics['average_precision']:.3f} auroc={metrics['auroc']:.3f} "
-            f"reward={metrics.get('reward_best', float('nan')):.3f} "
-            f"scale={metrics.get('reward_best_scale', float('nan')):.2f} "
+            f"reward={metrics.get('reward_prevalence', float('nan')):.3f} "
+            f"reward_best={metrics.get('reward_best', float('nan')):.3f} "
             f"pred_pos={metrics.get('binary_positive_rate', float('nan')):.3f}"
         )
 

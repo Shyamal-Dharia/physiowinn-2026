@@ -3,7 +3,12 @@ AGENTS.md
 dataset/
 eeg_cache/
 eeg_*.pt
-eeg_cv_results.json
+eeg_cv*_results.json
+downloading_data.ipynb
 .venv/
 __pycache__/
 *.pyc
+
+.gitignore
+team_code.py
+test_joint_eeg_loss.py
