@@ -1,5 +1,13 @@
 # Submission Ledger
 
+## lejepa-calibrated-leaderboard-auroc-0669-reward-0049
+
+- commit: `9289f5d8`
+- branch: `official-refresh`
+- official reward: `0.049`
+- official age-conditioned AUROC: `0.669`
+- notes: Calibrated joint EEG CNN-JEPA submission.
+
 ## cnn-leaderboard-auroc-0748-reward-0004
 
 - commit: `ef915235`
