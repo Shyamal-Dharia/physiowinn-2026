@@ -51,6 +51,7 @@ SIGREG_WEIGHT = 0.1
 EEG_VIEW_NOISE_STD = 0.02
 EEG_VIEW_CHANNEL_DROP = 0.1
 DEFAULT_THRESHOLD_SCALE = 3.85
+ENSEMBLE_SEEDS = (0, 1, 2)
 
 ################################################################################
 #
@@ -118,23 +119,33 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
     if meta['subjects_kept'] == 0:
         raise RuntimeError('No subjects with usable EEG windows.')
 
-    if verbose:
-        print('Training EEG CNN...')
-    model, history = train_eeg_baseline(
-        cache_folder,
-        epochs=CNN_EPOCHS,
-        batch_size=CNN_BATCH_SIZE,
-        data_folder=data_folder,
-        num_workers=2,
-    )
+    model_state_dicts = []
+    histories = []
+    best_epochs = []
+    for seed in ENSEMBLE_SEEDS:
+        if verbose:
+            print(f'Training EEG CNN seed {seed}...')
+        model, history = train_eeg_baseline(
+            cache_folder,
+            epochs=CNN_EPOCHS,
+            batch_size=CNN_BATCH_SIZE,
+            data_folder=data_folder,
+            num_workers=2,
+            seed=seed,
+        )
+        model_state_dicts.append({key: value.detach().cpu() for key, value in model.state_dict().items()})
+        histories.append(history)
+        best_epochs.append(max(history, key=auroc_selection_score))
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     labels = np.load(os.path.join(cache_folder, 'y.npy')).astype(np.int8)
     ages = load_cache_subject_ages(cache_folder, data_folder)
-    best = max(history, key=auroc_selection_score)
     checkpoint = {
-        'model_state_dict': model.state_dict(),
-        'pos_weight': float(best.get('pos_weight', 1.0)),
-        'threshold_scale': float(best.get('reward_best_scale', DEFAULT_THRESHOLD_SCALE)),
+        'model_state_dicts': model_state_dicts,
+        'pos_weight': float(np.mean([row.get('pos_weight', 1.0) for row in best_epochs])),
+        'threshold_scale': float(np.mean([row.get('reward_best_scale', DEFAULT_THRESHOLD_SCALE) for row in best_epochs])),
         'prevalence_labels': labels,
         'prevalence_ages': ages,
         'fallback_prevalence': float(labels.mean()),
@@ -142,7 +153,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
         'target_fs': TARGET_EEG_FS,
         'bandpass': EEG_BANDPASS_HZ,
         'num_windows': EEG_NUM_WINDOWS,
-        'history': history,
+        'histories': histories,
     }
     torch.save(checkpoint, os.path.join(model_folder, CNN_MODEL_FILE))
     import shutil
@@ -158,10 +169,15 @@ def load_model(model_folder, verbose):
     import torch
 
     checkpoint = torch.load(os.path.join(model_folder, CNN_MODEL_FILE), map_location='cpu', weights_only=False)
-    net = make_small_eeg_cnn()
-    net.load_state_dict(checkpoint['model_state_dict'])
-    net.eval()
-    checkpoint['model'] = net
+    state_dicts = checkpoint.get('model_state_dicts')
+    if state_dicts is None:
+        state_dicts = [checkpoint['model_state_dict']]
+    checkpoint['models'] = []
+    for state_dict in state_dicts:
+        net = make_small_eeg_cnn()
+        net.load_state_dict(state_dict)
+        net.eval()
+        checkpoint['models'].append(net)
     return checkpoint
 
 # Run your trained model. This function is *required*. You should edit this function to add your code, but do *not* change the
@@ -208,7 +224,7 @@ def run_model(model, record, data_folder, verbose):
                 windows = (windows - windows.mean(axis=-1, keepdims=True)) / (windows.std(axis=-1, keepdims=True) + 1e-6)
                 with torch.no_grad():
                     x = torch.from_numpy(windows.astype(np.float32, copy=False))
-                    probability_output = float(torch.sigmoid(model['model'](x).flatten().mean()).item())
+                    probability_output = predict_ensemble_probability(model['models'], x)
         except Exception as exc:
             if verbose:
                 print(f'EEG inference failed for {patient_id}: {exc}')
@@ -663,6 +679,16 @@ def make_small_eeg_cnn():
         torch.nn.Flatten(),
         torch.nn.Linear(128, 1),
     )
+
+
+def predict_ensemble_probability(models, x):
+    import torch
+
+    if not models:
+        raise ValueError('Ensemble must contain at least one model.')
+    with torch.no_grad():
+        logits = torch.stack([net(x).flatten() for net in models])
+        return float(torch.sigmoid(logits.mean()).item())
 
 
 def eeg_cnn_features(model, x):
