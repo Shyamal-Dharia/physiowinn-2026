@@ -1,9 +1,11 @@
 AGENTS.md
+physionetchallenge2026datalargeversion.zip
 
 dataset/
 eeg_cache/
 eeg_*.pt
 eeg_cv_results.json
+eeg_comparison_results.json
 .venv/
 __pycache__/
 *.pyc

@@ -43,9 +43,11 @@ TARGET_EEG_FS = 200.0
 EEG_BANDPASS_HZ = (0.1, 45.0)
 EEG_SEGMENT_SECONDS = 4.0
 EEG_NUM_WINDOWS = 300
-CNN_EPOCHS = 50
-CNN_BATCH_SIZE = 512
-CNN_MODEL_FILE = 'cnn_model.pt'
+EEG_EPOCHS = 50
+EEG_BATCH_SIZE = 512
+EEG_NUM_WORKERS = min(4, os.cpu_count() or 1)
+EEG_MODEL_NAME = 'rescnn'
+EEG_MODEL_FILE = 'eeg_model.pt'
 
 ################################################################################
 #
@@ -109,18 +111,25 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
 
     if verbose:
         print('Building EEG cache...')
-    meta = build_eeg_cache(data_folder, cache_folder, num_windows=EEG_NUM_WINDOWS, verbose=verbose)
+    meta = build_eeg_cache(
+        data_folder,
+        cache_folder,
+        num_windows=EEG_NUM_WINDOWS,
+        verbose=verbose,
+        num_workers=EEG_NUM_WORKERS,
+    )
     if meta['subjects_kept'] == 0:
         raise RuntimeError('No subjects with usable EEG windows.')
 
     if verbose:
-        print('Training EEG CNN...')
+        print(f'Training EEG {EEG_MODEL_NAME}...')
     model, history = train_eeg_baseline(
         cache_folder,
-        epochs=CNN_EPOCHS,
-        batch_size=CNN_BATCH_SIZE,
+        epochs=EEG_EPOCHS,
+        batch_size=EEG_BATCH_SIZE,
         data_folder=data_folder,
-        num_workers=2,
+        num_workers=EEG_NUM_WORKERS,
+        model_name=EEG_MODEL_NAME,
     )
 
     labels = np.load(os.path.join(cache_folder, 'y.npy')).astype(np.int8)
@@ -128,6 +137,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
     best = max(history, key=lambda row: row.get('reward_best', row.get('average_precision', -np.inf)))
     checkpoint = {
         'model_state_dict': model.state_dict(),
+        'model_name': EEG_MODEL_NAME,
         'threshold_scale': float(best.get('reward_best_scale', 1.0)),
         'prevalence_labels': labels,
         'prevalence_ages': ages,
@@ -138,7 +148,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
         'num_windows': EEG_NUM_WINDOWS,
         'history': history,
     }
-    torch.save(checkpoint, os.path.join(model_folder, CNN_MODEL_FILE))
+    torch.save(checkpoint, os.path.join(model_folder, EEG_MODEL_FILE))
     import shutil
     shutil.rmtree(cache_folder, ignore_errors=True)
 
@@ -151,8 +161,8 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
 def load_model(model_folder, verbose):
     import torch
 
-    checkpoint = torch.load(os.path.join(model_folder, CNN_MODEL_FILE), map_location='cpu', weights_only=False)
-    net = make_small_eeg_cnn()
+    checkpoint = torch.load(os.path.join(model_folder, EEG_MODEL_FILE), map_location='cpu', weights_only=False)
+    net = make_eeg_model(checkpoint['model_name'])
     net.load_state_dict(checkpoint['model_state_dict'])
     net.eval()
     checkpoint['model'] = net
@@ -376,7 +386,39 @@ def sample_eeg_windows(eeg_signals, fs, num_windows=200, channels=EEG_CHANNELS, 
     ]).astype(np.float32, copy=False)
 
 
-def build_eeg_cache(data_folder, cache_folder, num_windows=200, seed=0, channels=EEG_CHANNELS, target_fs=TARGET_EEG_FS, bandpass=EEG_BANDPASS_HZ, verbose=True):
+def _build_eeg_cache_record(task):
+    i, record, label, data_folder, num_windows, seed, channels, target_fs, bandpass = task
+    patient_id = record[HEADERS['bids_folder']]
+    site_id = record[HEADERS['site_id']]
+    session_id = record[HEADERS['session_id']]
+    row = {
+        'index': i,
+        'cache_index': '',
+        'patient_id': patient_id,
+        'site_id': site_id,
+        'session_id': session_id,
+        'status': 'skipped',
+        'reason': '',
+    }
+    try:
+        if label is None:
+            raise ValueError('missing_label')
+        edf_path = os.path.join(data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}.edf")
+        if not os.path.exists(edf_path):
+            row['reason'] = 'missing_edf'
+        else:
+            eeg_signals, fs = load_eeg_signals(edf_path, channels=channels, target_fs=target_fs, bandpass=bandpass)
+            windows = sample_eeg_windows(eeg_signals, fs, num_windows=num_windows, channels=channels, rng=seed + i)
+            expected_shape = (num_windows, len(channels), int(round(EEG_SEGMENT_SECONDS * target_fs)))
+            if windows.shape == expected_shape:
+                return row, label, windows
+            row['reason'] = f'windows_shape_{windows.shape}'
+    except Exception as e:
+        row['reason'] = str(e)
+    return row, None, None
+
+
+def build_eeg_cache(data_folder, cache_folder, num_windows=200, seed=0, channels=EEG_CHANNELS, target_fs=TARGET_EEG_FS, bandpass=EEG_BANDPASS_HZ, verbose=True, max_subjects=None, num_workers=0):
     """
     Build a subject-level EEG cache.
 
@@ -390,6 +432,20 @@ def build_eeg_cache(data_folder, cache_folder, num_windows=200, seed=0, channels
 
     patient_data_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
     records = find_patients(patient_data_file)
+    subjects_available = len(records)
+    if max_subjects is not None and max_subjects <= 0:
+        raise ValueError('max_subjects must be positive.')
+    if num_workers < 0:
+        raise ValueError('num_workers cannot be negative.')
+    if max_subjects is not None and max_subjects < len(records):
+        indices = np.sort(np.random.default_rng(seed).choice(len(records), max_subjects, replace=False))
+        records = [records[i] for i in indices]
+    with open(patient_data_file, newline='') as f:
+        labels = {
+            row[HEADERS['bids_folder']]: 1 if row[HEADERS['label']].casefold() == 'true' else 0
+            for row in csv.DictReader(f)
+            if row[HEADERS['label']]
+        }
     window = int(round(EEG_SEGMENT_SECONDS * target_fs))
     x_shape = (len(records), num_windows, len(channels), window)
     x_path = os.path.join(cache_folder, 'X.dat')
@@ -402,42 +458,31 @@ def build_eeg_cache(data_folder, cache_folder, num_windows=200, seed=0, channels
     rows = []
     kept = 0
 
-    iterator = tqdm(records, desc='Building EEG cache', unit='record', disable=not verbose)
-    for i, record in enumerate(iterator):
-        patient_id = record[HEADERS['bids_folder']]
-        site_id = record[HEADERS['site_id']]
-        session_id = record[HEADERS['session_id']]
-        row = {
-            'index': i,
-            'cache_index': '',
-            'patient_id': patient_id,
-            'site_id': site_id,
-            'session_id': session_id,
-            'status': 'skipped',
-            'reason': '',
-        }
+    tasks = [
+        (i, record, labels.get(record[HEADERS['bids_folder']]), data_folder, num_windows, seed, tuple(channels), target_fs, bandpass)
+        for i, record in enumerate(records)
+    ]
 
-        try:
-            label = load_diagnoses(patient_data_file, patient_id)
-            edf_path = os.path.join(data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}.edf")
-            if not os.path.exists(edf_path):
-                row['reason'] = 'missing_edf'
-            else:
-                eeg_signals, fs = load_eeg_signals(edf_path, channels=channels, target_fs=target_fs, bandpass=bandpass)
-                windows = sample_eeg_windows(eeg_signals, fs, num_windows=num_windows, channels=channels, rng=seed + i)
-                if windows.shape != (num_windows, len(channels), window):
-                    row['reason'] = f'windows_shape_{windows.shape}'
-                else:
-                    X[kept] = windows
-                    y.append(label)
-                    row['cache_index'] = kept
-                    row['status'] = 'kept'
-                    row['reason'] = ''
-                    kept += 1
-        except Exception as e:
-            row['reason'] = str(e)
+    def store(results):
+        nonlocal kept
+        iterator = tqdm(results, total=len(tasks), desc='Building EEG cache', unit='record', disable=not verbose)
+        for row, label, windows in iterator:
+            if windows is not None:
+                X[kept] = windows
+                y.append(label)
+                row['cache_index'] = kept
+                row['status'] = 'kept'
+                row['reason'] = ''
+                kept += 1
+            rows.append(row)
 
-        rows.append(row)
+    if num_workers:
+        from concurrent.futures import ProcessPoolExecutor
+
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            store(executor.map(_build_eeg_cache_record, tasks, chunksize=1))
+    else:
+        store(map(_build_eeg_cache_record, tasks))
 
     X.flush()
     del X
@@ -458,7 +503,9 @@ def build_eeg_cache(data_folder, cache_folder, num_windows=200, seed=0, channels
         'segment_seconds': EEG_SEGMENT_SECONDS,
         'bandpass': list(bandpass) if bandpass is not None else None,
         'seed': seed,
+        'num_workers': num_workers,
         'subjects_total': len(records),
+        'subjects_available': subjects_available,
         'subjects_kept': kept,
         'subjects_skipped': len(records) - kept,
         'x_path': x_path,
@@ -651,6 +698,84 @@ def make_small_eeg_cnn():
     )
 
 
+def make_residual_eeg_cnn():
+    import torch
+
+    class ResidualBlock(torch.nn.Module):
+        def __init__(self, in_channels, out_channels, kernel_size, stride=1):
+            super().__init__()
+            padding = kernel_size // 2
+            self.main = torch.nn.Sequential(
+                torch.nn.Conv1d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=False),
+                torch.nn.BatchNorm1d(out_channels),
+                torch.nn.ReLU(),
+                torch.nn.Conv1d(out_channels, out_channels, kernel_size, padding=padding, bias=False),
+                torch.nn.BatchNorm1d(out_channels),
+            )
+            self.skip = torch.nn.Identity() if in_channels == out_channels and stride == 1 else torch.nn.Sequential(
+                torch.nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                torch.nn.BatchNorm1d(out_channels),
+            )
+            self.activation = torch.nn.ReLU()
+
+        def forward(self, x):
+            return self.activation(self.main(x) + self.skip(x))
+
+    return torch.nn.Sequential(
+        torch.nn.Conv1d(len(EEG_CHANNELS), 32, kernel_size=15, stride=2, padding=7, bias=False),
+        torch.nn.BatchNorm1d(32),
+        torch.nn.ReLU(),
+        ResidualBlock(32, 64, kernel_size=9, stride=2),
+        ResidualBlock(64, 128, kernel_size=7, stride=2),
+        ResidualBlock(128, 128, kernel_size=5),
+        torch.nn.AdaptiveAvgPool1d(1),
+        torch.nn.Flatten(),
+        torch.nn.Linear(128, 1),
+    )
+
+
+def make_eeg_model(model_name):
+    if model_name == 'cnn':
+        return make_small_eeg_cnn()
+    if model_name == 'rescnn':
+        return make_residual_eeg_cnn()
+    if model_name in ('dgcnn', 'dgcnn_nodrop'):
+        import mne
+        from braindecode.models import DGCNN
+
+        info = mne.create_info(['F3', 'F4', 'C3', 'C4', 'O1', 'O2'], sfreq=TARGET_EEG_FS, ch_types='eeg')
+        info.set_montage(mne.channels.make_standard_montage('standard_1020'))
+        return DGCNN(
+            n_chans=len(EEG_CHANNELS),
+            n_outputs=1,
+            n_times=int(round(EEG_SEGMENT_SECONDS * TARGET_EEG_FS)),
+            chs_info=info['chs'],
+            drop_prob=0.0 if model_name == 'dgcnn_nodrop' else 0.5,
+        )
+    conformer_depths = {
+        'eegconformer': 6,
+        'eegconformer_depth2': 2,
+        'eegconformer_depth4': 4,
+    }
+    if model_name in conformer_depths:
+        import torch
+        from braindecode.models import EEGConformer
+
+        model = EEGConformer(
+            n_chans=len(EEG_CHANNELS),
+            n_outputs=1,
+            n_times=int(round(EEG_SEGMENT_SECONDS * TARGET_EEG_FS)),
+            drop_prob=0.0,
+            num_layers=conformer_depths[model_name],
+            att_drop_prob=0.0,
+        )
+        for module in model.modules():
+            if isinstance(module, torch.nn.Dropout):
+                module.p = 0.0
+        return model
+    raise ValueError(f"Unknown EEG model: {model_name}")
+
+
 def compute_internal_reward_metrics(labels, probabilities, ages, prevalence_labels, prevalence_ages):
     from evaluate_model import compute_auroc_age, compute_auroc_weighted, compute_prevalence, compute_reward
 
@@ -742,7 +867,7 @@ def evaluate_eeg_baseline(model, val_loader, device=None, ages=None, prevalence_
     return metrics
 
 
-def cross_validate_eeg_baseline(cache_folder, data_folder, folds=5, epochs=5, batch_size=512, lr=1e-3, seed=0, num_workers=2, device=None, reward_weighted=False, weight_clip=(0.25, 20.0), results_path=None):
+def cross_validate_eeg_baseline(cache_folder, data_folder, folds=5, epochs=5, batch_size=512, lr=1e-3, seed=0, num_workers=2, device=None, reward_weighted=False, weight_clip=(0.25, 20.0), results_path=None, model_name='cnn'):
     import torch
     from sklearn.metrics import average_precision_score, roc_auc_score
     from sklearn.model_selection import StratifiedKFold
@@ -770,7 +895,7 @@ def cross_validate_eeg_baseline(cache_folder, data_folder, folds=5, epochs=5, ba
         )
 
         counts = np.bincount(train_labels.astype(int), minlength=2)
-        model = make_small_eeg_cnn().to(device)
+        model = make_eeg_model(model_name).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
         if reward_weighted:
             loss_fn = torch.nn.BCEWithLogitsLoss(reduction='none')
@@ -831,6 +956,7 @@ def cross_validate_eeg_baseline(cache_folder, data_folder, folds=5, epochs=5, ba
         'oof_reward_prevalence': float(np.average([m['reward_prevalence'] for m in fold_metrics], weights=weights)),
         'oof_reward_best_optimistic': float(np.average([m['reward_best'] for m in fold_metrics], weights=weights)),
         'reward_weighted': reward_weighted,
+        'model_name': model_name,
         'fold_metrics': fold_metrics,
     }
 
@@ -847,7 +973,7 @@ def cross_validate_eeg_baseline(cache_folder, data_folder, folds=5, epochs=5, ba
     return summary
 
 
-def train_eeg_baseline(cache_folder, model_path=None, epochs=3, batch_size=128, lr=1e-3, val_fraction=0.2, seed=0, num_workers=0, device=None, data_folder=None, reward_weighted=False, weight_clip=(0.25, 20.0)):
+def train_eeg_baseline(cache_folder, model_path=None, epochs=3, batch_size=128, lr=1e-3, val_fraction=0.2, seed=0, num_workers=0, device=None, data_folder=None, reward_weighted=False, weight_clip=(0.25, 20.0), model_name='cnn'):
     import torch
 
     torch.manual_seed(seed)
@@ -874,7 +1000,7 @@ def train_eeg_baseline(cache_folder, model_path=None, epochs=3, batch_size=128, 
     )
 
     counts = np.bincount(train_labels.astype(int), minlength=2)
-    model = make_small_eeg_cnn().to(device)
+    model = make_eeg_model(model_name).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     if reward_weighted:
         loss_fn = torch.nn.BCEWithLogitsLoss(reduction='none')
@@ -935,7 +1061,7 @@ def train_eeg_baseline(cache_folder, model_path=None, epochs=3, batch_size=128, 
         model.load_state_dict(best_state)
 
     if model_path:
-        torch.save({'model_state_dict': model.state_dict(), 'history': history}, model_path)
+        torch.save({'model_state_dict': model.state_dict(), 'model_name': model_name, 'history': history}, model_path)
 
     return model, history
 

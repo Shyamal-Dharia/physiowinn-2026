@@ -1,0 +1,14 @@
+.git/
+.venv/
+__pycache__/
+*.py[cod]
+
+dataset/
+eeg_cache/
+physionetchallenge2026datalargeversion.zip
+*.pt
+*_results.json
+
+compare_eeg_models.py
+*.slurm
+test_*.py
