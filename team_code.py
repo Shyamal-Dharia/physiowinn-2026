@@ -46,9 +46,13 @@ EEG_NUM_WINDOWS = 300
 EEG_EPOCHS = 50
 EEG_BATCH_SIZE = 512
 EEG_NUM_WORKERS = min(4, os.cpu_count() or 1)
-EEG_MODEL_NAME = 'rescnn'
+EEG_MODEL_NAME = 'eegconformer_depth4'
 EEG_MODEL_NAMES = ('cnn', 'rescnn')
 EEG_BLEND_WEIGHTS = (0.5, 0.5)
+EEG_SEED = 2
+EEG_AGE_RANK_WEIGHT = 0.0
+EEG_AGE_RANK_GAP = 2.0
+EEG_CHECKPOINT_METRIC = 'age_conditioned_auroc'
 EEG_MODEL_FILE = 'eeg_model.pt'
 
 ################################################################################
@@ -123,36 +127,33 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
     if meta['subjects_kept'] == 0:
         raise RuntimeError('No subjects with usable EEG windows.')
 
+    if verbose:
+        print(f'Training EEG {EEG_MODEL_NAME}...')
+    net, history = train_eeg_baseline(
+        cache_folder,
+        epochs=EEG_EPOCHS,
+        batch_size=EEG_BATCH_SIZE,
+        data_folder=data_folder,
+        num_workers=EEG_NUM_WORKERS,
+        seed=EEG_SEED,
+        model_name=EEG_MODEL_NAME,
+        age_rank_weight=EEG_AGE_RANK_WEIGHT,
+        age_rank_gap=EEG_AGE_RANK_GAP,
+        checkpoint_metric=EEG_CHECKPOINT_METRIC,
+    )
+
     labels = np.load(os.path.join(cache_folder, 'y.npy')).astype(np.int8)
     ages = load_cache_subject_ages(cache_folder, data_folder)
-    models = []
-    for model_name in EEG_MODEL_NAMES:
-        if verbose:
-            print(f'Training EEG {model_name}...')
-        net, history, calibration_probabilities = train_eeg_baseline(
-            cache_folder,
-            epochs=EEG_EPOCHS,
-            batch_size=EEG_BATCH_SIZE,
-            data_folder=data_folder,
-            num_workers=EEG_NUM_WORKERS,
-            model_name=model_name,
-            return_calibration=True,
-        )
-        best = max(history, key=eeg_checkpoint_score)
-        models.append({
-            'model_name': model_name,
-            'model_state_dict': {name: value.detach().cpu() for name, value in net.state_dict().items()},
-            'calibration_probabilities': calibration_probabilities,
-            'selected_epoch': int(best['epoch']),
-            'history': history,
-        })
-        del net
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
+    best = max(history, key=lambda row: eeg_checkpoint_score(row, EEG_CHECKPOINT_METRIC))
     checkpoint = {
-        'models': models,
-        'blend_weights': EEG_BLEND_WEIGHTS,
+        'model_name': EEG_MODEL_NAME,
+        'model_state_dict': {name: value.detach().cpu() for name, value in net.state_dict().items()},
+        'threshold_scale': float(best.get('reward_best_scale', 1.0)),
+        'selected_epoch': int(best['epoch']),
+        'checkpoint_metric': EEG_CHECKPOINT_METRIC,
+        'seed': EEG_SEED,
+        'age_rank_weight': EEG_AGE_RANK_WEIGHT,
+        'age_rank_gap': EEG_AGE_RANK_GAP,
         'prevalence_labels': labels,
         'prevalence_ages': ages,
         'fallback_prevalence': float(labels.mean()),
@@ -160,6 +161,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
         'target_fs': TARGET_EEG_FS,
         'bandpass': EEG_BANDPASS_HZ,
         'num_windows': EEG_NUM_WINDOWS,
+        'history': history,
     }
     torch.save(checkpoint, os.path.join(model_folder, EEG_MODEL_FILE))
     import shutil
@@ -566,7 +568,7 @@ class EEGCacheDataset:
     level='window': returns x shape (6, 800), y
     level='subject': returns x shape (200, 6, 800), y
     """
-    def __init__(self, cache_folder, level='window', normalize=True, subject_weights=None):
+    def __init__(self, cache_folder, level='window', normalize=True, subject_weights=None, subject_ages=None):
         import torch
 
         if level not in ('window', 'subject'):
@@ -583,6 +585,7 @@ class EEGCacheDataset:
         self.X = np.memmap(_cache_file(cache_folder, self.meta, 'x_path'), dtype=np.float32, mode='r', shape=self.shape)
         self.y = np.load(_cache_file(cache_folder, self.meta, 'y_path'))
         self.subject_weights = None if subject_weights is None else np.asarray(subject_weights, dtype=np.float32)
+        self.subject_ages = None if subject_ages is None else np.asarray(subject_ages, dtype=np.float32)
 
     def __len__(self):
         subjects, windows, _, _ = self.shape
@@ -602,9 +605,12 @@ class EEGCacheDataset:
 
         x = self.torch.from_numpy(x)
         y = self.torch.tensor(self.y[subject_index], dtype=self.torch.float32)
-        if self.subject_weights is None:
-            return x, y
-        return x, y, self.torch.tensor(self.subject_weights[subject_index], dtype=self.torch.float32)
+        output = [x, y]
+        if self.subject_weights is not None:
+            output.append(self.torch.tensor(self.subject_weights[subject_index], dtype=self.torch.float32))
+        if self.subject_ages is not None:
+            output.append(self.torch.tensor(self.subject_ages[subject_index], dtype=self.torch.float32))
+        return tuple(output)
 
 
 def make_eeg_dataloader(cache_folder, batch_size=64, level='window', shuffle=True, num_workers=0, normalize=True):
@@ -638,13 +644,19 @@ def _window_indices(subject_indices, num_windows):
     return np.concatenate([np.arange(i * num_windows, (i + 1) * num_windows) for i in subject_indices])
 
 
-def make_eeg_supervised_loaders(cache_folder, batch_size=128, val_fraction=0.2, seed=0, num_workers=0, normalize=True, train_subjects=None, val_subjects=None, subject_weights=None):
+def make_eeg_supervised_loaders(cache_folder, batch_size=128, val_fraction=0.2, seed=0, num_workers=0, normalize=True, train_subjects=None, val_subjects=None, subject_weights=None, subject_ages=None):
     from torch.utils.data import DataLoader, Subset
 
     if train_subjects is None or val_subjects is None:
         train_subjects, val_subjects = split_eeg_subjects(cache_folder, val_fraction=val_fraction, seed=seed)
 
-    window_dataset = EEGCacheDataset(cache_folder, level='window', normalize=normalize, subject_weights=subject_weights)
+    window_dataset = EEGCacheDataset(
+        cache_folder,
+        level='window',
+        normalize=normalize,
+        subject_weights=subject_weights,
+        subject_ages=subject_ages,
+    )
     subject_dataset = EEGCacheDataset(cache_folder, level='subject', normalize=normalize)
     num_windows = window_dataset.shape[1]
 
@@ -807,13 +819,33 @@ def make_eeg_model(model_name):
     raise ValueError(f"Unknown EEG model: {model_name}")
 
 
-def eeg_checkpoint_score(metrics):
-    """Score EEG checkpoints by the Challenge metric, with non-reward fallbacks."""
-    for name in ('age_conditioned_auroc', 'auroc', 'average_precision'):
+def eeg_checkpoint_score(metrics, metric='age_conditioned_auroc'):
+    """Score an EEG checkpoint by the requested validation metric."""
+    if metric not in ('age_conditioned_auroc', 'reward_best', 'auroc', 'average_precision'):
+        raise ValueError(f'Unknown EEG checkpoint metric: {metric}')
+    for name in (metric, 'auroc', 'average_precision'):
         score = metrics.get(name)
         if score is not None and np.isfinite(score):
             return float(score)
     return -np.inf
+
+
+def age_conditioned_pairwise_loss(logits, labels, ages, gap=2.0):
+    """Smooth surrogate for ranking age-matched positives above negatives."""
+    import torch
+
+    finite = torch.isfinite(ages)
+    positive = (labels > 0.5) & finite
+    negative = (labels <= 0.5) & finite
+    positive_logits = logits[positive]
+    negative_logits = logits[negative]
+    if positive_logits.numel() == 0 or negative_logits.numel() == 0:
+        return logits.sum() * 0
+
+    matched = torch.abs(ages[positive, None] - ages[None, negative]) <= gap
+    differences = positive_logits[:, None] - negative_logits[None, :]
+    losses = torch.nn.functional.softplus(-differences) * matched
+    return losses.sum() / matched.sum().clamp_min(1)
 
 
 def empirical_cdf_score(probability, calibration_probabilities):
@@ -945,11 +977,13 @@ def rank_normalize_eeg_folds(probabilities, fold_indices):
     return normalized
 
 
-def cross_validate_eeg_baseline(cache_folder, data_folder, folds=5, epochs=5, batch_size=512, lr=1e-3, seed=0, num_workers=2, device=None, reward_weighted=False, weight_clip=(0.25, 20.0), results_path=None, model_name='cnn', fold_index=None):
+def cross_validate_eeg_baseline(cache_folder, data_folder, folds=5, epochs=5, batch_size=512, lr=1e-3, seed=0, num_workers=2, device=None, reward_weighted=False, weight_clip=(0.25, 20.0), results_path=None, model_name='cnn', fold_index=None, age_rank_weight=0.0, age_rank_gap=2.0, checkpoint_metric='age_conditioned_auroc'):
     import torch
     from sklearn.metrics import average_precision_score, roc_auc_score
     from sklearn.model_selection import StratifiedKFold
 
+    if age_rank_weight < 0 or age_rank_gap < 0:
+        raise ValueError('Age-ranking weight and gap must be non-negative.')
     torch.manual_seed(seed)
     np.random.seed(seed)
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -981,6 +1015,7 @@ def cross_validate_eeg_baseline(cache_folder, data_folder, folds=5, epochs=5, ba
             train_subjects=train_subjects,
             val_subjects=val_subjects,
             subject_weights=subject_weights,
+            subject_ages=ages if age_rank_weight else None,
         )
 
         counts = np.bincount(train_labels.astype(int), minlength=2)
@@ -999,20 +1034,26 @@ def cross_validate_eeg_baseline(cache_folder, data_folder, folds=5, epochs=5, ba
         for epoch in range(1, epochs + 1):
             model.train()
             losses = []
+            rank_losses = []
             for batch in train_loader:
+                x, yb, *extras = batch
+                extra_index = 0
                 if reward_weighted:
-                    x, yb, wb = batch
+                    wb = extras[extra_index]
+                    extra_index += 1
                     wb = wb.to(device)
-                else:
-                    x, yb = batch
+                ageb = extras[extra_index].to(device) if age_rank_weight else None
                 x = x.to(device)
                 yb = yb.to(device)
                 optimizer.zero_grad(set_to_none=True)
                 logits = model(x).flatten()
-                loss = (loss_fn(logits, yb) * wb).mean() if reward_weighted else loss_fn(logits, yb)
+                classification_loss = (loss_fn(logits, yb) * wb).mean() if reward_weighted else loss_fn(logits, yb)
+                rank_loss = age_conditioned_pairwise_loss(logits, yb, ageb, gap=age_rank_gap) if age_rank_weight else logits.sum() * 0
+                loss = classification_loss + age_rank_weight * rank_loss
                 loss.backward()
                 optimizer.step()
                 losses.append(float(loss.detach().cpu()))
+                rank_losses.append(float(rank_loss.detach().cpu()))
 
             val_labels, val_probs = predict_eeg_subject_probabilities(model, val_loader, device=device)
             metrics = compute_internal_reward_metrics(
@@ -1026,12 +1067,13 @@ def cross_validate_eeg_baseline(cache_folder, data_folder, folds=5, epochs=5, ba
                 'fold': fold,
                 'epoch': epoch,
                 'train_loss': float(np.mean(losses)),
+                'train_age_rank_loss': float(np.mean(rank_losses)),
                 'auroc': float(roc_auc_score(val_labels, val_probs)),
                 'average_precision': float(average_precision_score(val_labels, val_probs)),
                 'val_subjects': int(len(val_subjects)),
             })
             history.append(metrics)
-            score = eeg_checkpoint_score(metrics)
+            score = eeg_checkpoint_score(metrics, checkpoint_metric)
             if score > best_score:
                 best_score = score
                 best_metrics = metrics.copy()
@@ -1068,6 +1110,9 @@ def cross_validate_eeg_baseline(cache_folder, data_folder, folds=5, epochs=5, ba
         'oof_reward_prevalence': float(np.average([m['reward_prevalence'] for m in fold_metrics], weights=weights)),
         'oof_reward_best_optimistic': float(np.average([m['reward_best'] for m in fold_metrics], weights=weights)),
         'reward_weighted': reward_weighted,
+        'age_rank_weight': age_rank_weight,
+        'age_rank_gap': age_rank_gap,
+        'checkpoint_metric': checkpoint_metric,
         'model_name': model_name,
         'fold_metrics': fold_metrics,
         'fold_histories': fold_histories,
@@ -1092,9 +1137,11 @@ def cross_validate_eeg_baseline(cache_folder, data_folder, folds=5, epochs=5, ba
     return summary
 
 
-def train_eeg_baseline(cache_folder, model_path=None, epochs=3, batch_size=128, lr=1e-3, val_fraction=0.2, seed=0, num_workers=0, device=None, data_folder=None, reward_weighted=False, weight_clip=(0.25, 20.0), model_name='cnn', return_calibration=False):
+def train_eeg_baseline(cache_folder, model_path=None, epochs=3, batch_size=128, lr=1e-3, val_fraction=0.2, seed=0, num_workers=0, device=None, data_folder=None, reward_weighted=False, weight_clip=(0.25, 20.0), model_name='cnn', return_calibration=False, age_rank_weight=0.0, age_rank_gap=2.0, checkpoint_metric='age_conditioned_auroc'):
     import torch
 
+    if age_rank_weight < 0 or age_rank_gap < 0:
+        raise ValueError('Age-ranking weight and gap must be non-negative.')
     torch.manual_seed(seed)
     np.random.seed(seed)
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1103,8 +1150,8 @@ def train_eeg_baseline(cache_folder, model_path=None, epochs=3, batch_size=128, 
     train_labels = all_labels[train_subjects]
     subject_ages = load_cache_subject_ages(cache_folder, data_folder) if data_folder is not None else None
 
-    if reward_weighted and subject_ages is None:
-        raise ValueError("reward_weighted=True requires data_folder for subject ages.")
+    if (reward_weighted or age_rank_weight) and subject_ages is None:
+        raise ValueError("Age-aware EEG training requires data_folder for subject ages.")
 
     subject_weights = compute_reward_training_weights(all_labels, subject_ages, train_subjects, clip=weight_clip) if reward_weighted else None
     train_loader, val_loader, train_subjects, val_subjects = make_eeg_supervised_loaders(
@@ -1116,6 +1163,7 @@ def train_eeg_baseline(cache_folder, model_path=None, epochs=3, batch_size=128, 
         train_subjects=train_subjects,
         val_subjects=val_subjects,
         subject_weights=subject_weights,
+        subject_ages=subject_ages if age_rank_weight else None,
     )
 
     counts = np.bincount(train_labels.astype(int), minlength=2)
@@ -1133,23 +1181,26 @@ def train_eeg_baseline(cache_folder, model_path=None, epochs=3, batch_size=128, 
     for epoch in range(1, epochs + 1):
         model.train()
         losses = []
+        rank_losses = []
         for batch in train_loader:
+            x, yb, *extras = batch
+            extra_index = 0
             if reward_weighted:
-                x, yb, wb = batch
+                wb = extras[extra_index]
+                extra_index += 1
                 wb = wb.to(device)
-            else:
-                x, yb = batch
+            ageb = extras[extra_index].to(device) if age_rank_weight else None
             x = x.to(device)
             yb = yb.to(device)
             optimizer.zero_grad(set_to_none=True)
             logits = model(x).flatten()
-            if reward_weighted:
-                loss = (loss_fn(logits, yb) * wb).mean()
-            else:
-                loss = loss_fn(logits, yb)
+            classification_loss = (loss_fn(logits, yb) * wb).mean() if reward_weighted else loss_fn(logits, yb)
+            rank_loss = age_conditioned_pairwise_loss(logits, yb, ageb, gap=age_rank_gap) if age_rank_weight else logits.sum() * 0
+            loss = classification_loss + age_rank_weight * rank_loss
             loss.backward()
             optimizer.step()
             losses.append(float(loss.detach().cpu()))
+            rank_losses.append(float(rank_loss.detach().cpu()))
 
         if subject_ages is None:
             metrics = evaluate_eeg_baseline(model, val_loader, device=device)
@@ -1162,9 +1213,15 @@ def train_eeg_baseline(cache_folder, model_path=None, epochs=3, batch_size=128, 
                 prevalence_labels=train_labels,
                 prevalence_ages=subject_ages[train_subjects],
             )
-        metrics.update({'epoch': epoch, 'train_loss': float(np.mean(losses)), 'reward_weighted': reward_weighted})
+        metrics.update({
+            'epoch': epoch,
+            'train_loss': float(np.mean(losses)),
+            'train_age_rank_loss': float(np.mean(rank_losses)),
+            'reward_weighted': reward_weighted,
+            'age_rank_weight': age_rank_weight,
+        })
         history.append(metrics)
-        score = eeg_checkpoint_score(metrics)
+        score = eeg_checkpoint_score(metrics, checkpoint_metric)
         if score > best_score:
             best_score = score
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
