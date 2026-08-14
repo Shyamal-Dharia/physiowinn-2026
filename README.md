@@ -1,10 +1,19 @@
-# Python example code for the George B. Moody PhysioNet Challenge 2026
+# PhysioWinn entry for the George B. Moody PhysioNet Challenge 2026
 
-## What's in this repository?
+This repository contains a trainable submission for predicting future cognitive impairment from polysomnography and basic demographics. It uses only the provided Challenge training data and does not require external model checkpoints or network access.
 
-This repository contains a simple example that illustrates how to format a Python entry for the [George B. Moody PhysioNet Challenge 2026](https://physionetchallenges.org/2026/). If you are participating in the 2026 Challenge, then we recommend using this repository as a template for your entry. You can remove some of the code, reuse other code, and add new code to create your entry. You do not need to use the models, features, and/or libraries in this example for your entry. We encourage a diversity of approaches to the Challenges.
+## Model
 
-For this example, we implemented a random forest model with several simple features. (This simple example is **not** designed to perform well, so you should **not** use it as a baseline for your approach's performance.) You can try it by running the following commands on the Challenge training set. If you are using a relatively recent personal computer, then you should be able to run these commands from start to finish on a small subset (1000 records) of the training data in a few minutes or less.
+The prediction is a calibrated blend of:
+
+- a site-balanced Extra Trees model over BMI and automated CAISR sleep-stage, arousal, respiratory-event, and limb-movement summaries; and
+- lightweight convolutional and residual convolutional EEG models over 300 four-second windows from six canonical EEG derivations.
+
+The final weights are 67.5% CAISR and 32.5% EEG. Within the EEG branch, the CNN and residual CNN weights are 40% and 60%, respectively. Missing annotations or EEG channels fall back to the available branch and ultimately to age-conditioned training prevalence.
+
+## Authors
+
+Shyamal Dharia
 
 ## How do I run these scripts?
 

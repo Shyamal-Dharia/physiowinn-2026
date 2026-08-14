@@ -10,5 +10,10 @@ physionetchallenge2026datalargeversion.zip
 *_results.json
 
 compare_eeg_models.py
+analyze_*.py
+benchmark_*.py
 *.slurm
 test_*.py
+logs/
+results/
+submissions.md

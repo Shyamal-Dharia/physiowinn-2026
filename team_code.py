@@ -14,6 +14,7 @@ import csv
 import json
 import numpy as np
 import os
+from concurrent.futures import ProcessPoolExecutor
 from fractions import Fraction
 from scipy.signal import butter, resample_poly, sosfiltfilt
 from tqdm import tqdm
@@ -46,14 +47,17 @@ EEG_NUM_WINDOWS = 300
 EEG_EPOCHS = 50
 EEG_BATCH_SIZE = 512
 EEG_NUM_WORKERS = min(4, os.cpu_count() or 1)
-EEG_MODEL_NAME = 'eegconformer_depth4'
+EEG_MODEL_NAME = 'rescnn'
 EEG_MODEL_NAMES = ('cnn', 'rescnn')
-EEG_BLEND_WEIGHTS = (0.5, 0.5)
-EEG_SEED = 2
+EEG_BLEND_WEIGHTS = (0.4, 0.6)
+EEG_SEED = 0
 EEG_AGE_RANK_WEIGHT = 0.0
 EEG_AGE_RANK_GAP = 2.0
 EEG_CHECKPOINT_METRIC = 'age_conditioned_auroc'
 EEG_MODEL_FILE = 'eeg_model.pt'
+ANNOTATION_BLEND_WEIGHT = 0.675
+ANNOTATION_FOLDS = 3
+ANNOTATION_FEATURE_COUNT = 47
 
 ################################################################################
 #
@@ -127,33 +131,52 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
     if meta['subjects_kept'] == 0:
         raise RuntimeError('No subjects with usable EEG windows.')
 
-    if verbose:
-        print(f'Training EEG {EEG_MODEL_NAME}...')
-    net, history = train_eeg_baseline(
-        cache_folder,
-        epochs=EEG_EPOCHS,
-        batch_size=EEG_BATCH_SIZE,
-        data_folder=data_folder,
-        num_workers=EEG_NUM_WORKERS,
-        seed=EEG_SEED,
-        model_name=EEG_MODEL_NAME,
-        age_rank_weight=EEG_AGE_RANK_WEIGHT,
-        age_rank_gap=EEG_AGE_RANK_GAP,
-        checkpoint_metric=EEG_CHECKPOINT_METRIC,
-    )
-
     labels = np.load(os.path.join(cache_folder, 'y.npy')).astype(np.int8)
     ages = load_cache_subject_ages(cache_folder, data_folder)
-    best = max(history, key=lambda row: eeg_checkpoint_score(row, EEG_CHECKPOINT_METRIC))
+    models = []
+    for model_name in EEG_MODEL_NAMES:
+        if verbose:
+            print(f'Training EEG {model_name}...')
+        net, history, calibration_probabilities = train_eeg_baseline(
+            cache_folder,
+            epochs=EEG_EPOCHS,
+            batch_size=EEG_BATCH_SIZE,
+            data_folder=data_folder,
+            num_workers=EEG_NUM_WORKERS,
+            seed=EEG_SEED,
+            model_name=model_name,
+            return_calibration=True,
+            age_rank_weight=EEG_AGE_RANK_WEIGHT,
+            age_rank_gap=EEG_AGE_RANK_GAP,
+            checkpoint_metric=EEG_CHECKPOINT_METRIC,
+        )
+        best = max(history, key=lambda row: eeg_checkpoint_score(row, EEG_CHECKPOINT_METRIC))
+        models.append({
+            'model_name': model_name,
+            'model_state_dict': {name: value.detach().cpu() for name, value in net.state_dict().items()},
+            'calibration_probabilities': calibration_probabilities,
+            'selected_epoch': int(best['epoch']),
+            'history': history,
+        })
+        del net
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if verbose:
+        print('Training CAISR annotation model...')
+    annotation_model, annotation_calibration = train_annotation_model(
+        data_folder,
+        folds=ANNOTATION_FOLDS,
+        seed=EEG_SEED,
+        num_workers=EEG_NUM_WORKERS,
+    )
     checkpoint = {
-        'model_name': EEG_MODEL_NAME,
-        'model_state_dict': {name: value.detach().cpu() for name, value in net.state_dict().items()},
-        'threshold_scale': float(best.get('reward_best_scale', 1.0)),
-        'selected_epoch': int(best['epoch']),
-        'checkpoint_metric': EEG_CHECKPOINT_METRIC,
+        'models': models,
+        'blend_weights': EEG_BLEND_WEIGHTS,
         'seed': EEG_SEED,
-        'age_rank_weight': EEG_AGE_RANK_WEIGHT,
-        'age_rank_gap': EEG_AGE_RANK_GAP,
+        'annotation_model': annotation_model,
+        'annotation_calibration_probabilities': annotation_calibration,
+        'annotation_blend_weight': ANNOTATION_BLEND_WEIGHT,
         'prevalence_labels': labels,
         'prevalence_ages': ages,
         'fallback_prevalence': float(labels.mean()),
@@ -161,7 +184,6 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
         'target_fs': TARGET_EEG_FS,
         'bandpass': EEG_BANDPASS_HZ,
         'num_windows': EEG_NUM_WINDOWS,
-        'history': history,
     }
     torch.save(checkpoint, os.path.join(model_folder, EEG_MODEL_FILE))
     import shutil
@@ -176,20 +198,23 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
 def load_model(model_folder, verbose):
     import torch
 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     checkpoint = torch.load(os.path.join(model_folder, EEG_MODEL_FILE), map_location='cpu', weights_only=False)
     if 'models' in checkpoint:
         for saved_model in checkpoint['models']:
-            net = make_eeg_model(saved_model['model_name'])
+            net = make_eeg_model(saved_model['model_name']).to(device)
             net.load_state_dict(saved_model['model_state_dict'])
             net.eval()
             saved_model['model'] = net
+        checkpoint['device'] = device
         return checkpoint
 
     # Backward compatibility for earlier single-model checkpoints.
-    net = make_eeg_model(checkpoint['model_name'])
+    net = make_eeg_model(checkpoint['model_name']).to(device)
     net.load_state_dict(checkpoint['model_state_dict'])
     net.eval()
     checkpoint['model'] = net
+    checkpoint['device'] = device
     return checkpoint
 
 # Run your trained model. This function is *required*. You should edit this function to add your code, but do *not* change the
@@ -212,41 +237,60 @@ def run_model(model, record, data_folder, verbose):
         fallback=model['fallback_prevalence'],
     )
 
+    eeg_probability = None
     edf_path = os.path.join(data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}.edf")
-    valid_windows = False
-    if not os.path.exists(edf_path):
-        probability_output = prevalence
-    else:
-        eeg_signals, fs = load_eeg_signals(
-            edf_path,
-            channels=tuple(model['channels']),
-            target_fs=model['target_fs'],
-            bandpass=tuple(model['bandpass']) if model['bandpass'] is not None else None,
-        )
-        windows = sample_eeg_windows(
-            eeg_signals,
-            fs,
-            num_windows=int(model['num_windows']),
-            channels=tuple(model['channels']),
-            rng=0,
-        )
-        if windows.shape != (int(model['num_windows']), len(model['channels']), int(round(EEG_SEGMENT_SECONDS * model['target_fs']))):
-            probability_output = prevalence
-        else:
-            valid_windows = True
-            windows = (windows - windows.mean(axis=-1, keepdims=True)) / (windows.std(axis=-1, keepdims=True) + 1e-6)
-            with torch.no_grad():
-                x = torch.from_numpy(windows.astype(np.float32, copy=False))
-                if 'models' in model:
-                    scores = []
-                    for saved_model in model['models']:
-                        raw_probability = float(torch.sigmoid(saved_model['model'](x)).mean().item())
-                        scores.append(empirical_cdf_score(raw_probability, saved_model['calibration_probabilities']))
-                    probability_output = float(np.average(scores, weights=model['blend_weights']))
-                else:
-                    probability_output = float(torch.sigmoid(model['model'](x)).mean().item())
+    if os.path.exists(edf_path):
+        try:
+            eeg_signals, fs = load_eeg_signals(
+                edf_path,
+                channels=tuple(model['channels']),
+                target_fs=model['target_fs'],
+                bandpass=tuple(model['bandpass']) if model['bandpass'] is not None else None,
+            )
+            windows = sample_eeg_windows(
+                eeg_signals,
+                fs,
+                num_windows=int(model['num_windows']),
+                channels=tuple(model['channels']),
+                rng=0,
+            )
+            expected_shape = (
+                int(model['num_windows']), len(model['channels']),
+                int(round(EEG_SEGMENT_SECONDS * model['target_fs'])),
+            )
+            if windows.shape == expected_shape:
+                windows = (windows - windows.mean(axis=-1, keepdims=True)) / (windows.std(axis=-1, keepdims=True) + 1e-6)
+                with torch.no_grad():
+                    x = torch.from_numpy(windows.astype(np.float32, copy=False)).to(model.get('device', 'cpu'))
+                    if 'models' in model:
+                        scores = []
+                        for saved_model in model['models']:
+                            raw_probability = float(torch.sigmoid(saved_model['model'](x)).mean().item())
+                            scores.append(empirical_cdf_score(raw_probability, saved_model['calibration_probabilities']))
+                        eeg_probability = float(np.average(scores, weights=model['blend_weights']))
+                    else:
+                        eeg_probability = float(torch.sigmoid(model['model'](x)).mean().item())
+        except Exception as exc:
+            if verbose:
+                print(f'EEG inference failed for {patient_id}: {exc}')
 
-    threshold = 0.5 if 'models' in model and valid_windows else np.clip(prevalence * float(model.get('threshold_scale', 1.0)), 1e-6, 1 - 1e-6)
+    annotation_probability = predict_annotation_probability(
+        model, data_folder, site_id, patient_id, session_id, patient_data,
+    )
+    if eeg_probability is not None and annotation_probability is not None:
+        annotation_weight = float(model.get('annotation_blend_weight', 0.0))
+        probability_output = (1 - annotation_weight) * eeg_probability + annotation_weight * annotation_probability
+    elif eeg_probability is not None:
+        probability_output = eeg_probability
+    elif annotation_probability is not None:
+        probability_output = annotation_probability
+    else:
+        probability_output = prevalence
+
+    if not np.isfinite(probability_output):
+        probability_output = prevalence
+    probability_output = float(np.clip(probability_output, 0, 1))
+    threshold = 0.5 if eeg_probability is not None or annotation_probability is not None else np.clip(prevalence * float(model.get('threshold_scale', 1.0)), 1e-6, 1 - 1e-6)
     binary_output = bool(probability_output > threshold)
     return binary_output, probability_output
 
@@ -722,11 +766,12 @@ def compute_reward_training_weights(labels, ages, train_subjects, clip=(0.25, 20
     return weights
 
 
-def make_small_eeg_cnn():
+def make_small_eeg_cnn(num_channels=None):
     import torch
 
+    num_channels = len(EEG_CHANNELS) if num_channels is None else int(num_channels)
     return torch.nn.Sequential(
-        torch.nn.Conv1d(len(EEG_CHANNELS), 32, kernel_size=15, stride=2, padding=7),
+        torch.nn.Conv1d(num_channels, 32, kernel_size=15, stride=2, padding=7),
         torch.nn.BatchNorm1d(32),
         torch.nn.ReLU(),
         torch.nn.Conv1d(32, 64, kernel_size=9, stride=2, padding=4),
@@ -739,6 +784,35 @@ def make_small_eeg_cnn():
         torch.nn.Flatten(),
         torch.nn.Linear(128, 1),
     )
+
+
+def make_small_eeg_cnn_transformer(num_channels=None):
+    import torch
+
+    num_channels = len(EEG_CHANNELS) if num_channels is None else int(num_channels)
+
+    return torch.nn.Sequential(
+        torch.nn.TransformerEncoderLayer(d_model=800, nhead=8, batch_first=True, dim_feedforward=1600),
+        torch.nn.Conv1d(num_channels, 32, kernel_size=15, stride=2, padding=7),
+        torch.nn.BatchNorm1d(32),
+        torch.nn.ReLU(),
+        torch.nn.Conv1d(32, 64, kernel_size=9, stride=2, padding=4),
+        torch.nn.BatchNorm1d(64),
+        torch.nn.ReLU(),
+        torch.nn.Conv1d(64, 128, kernel_size=7, stride=2, padding=3),
+        torch.nn.BatchNorm1d(128),
+        torch.nn.ReLU(),
+        torch.nn.AdaptiveAvgPool1d(1),
+        torch.nn.Flatten(),
+        torch.nn.Linear(128, 1),
+    )
+
+
+
+def predict_ensemble_probability(models, windows):
+    import torch
+
+    return float(np.mean([torch.sigmoid(model(windows)).mean().item() for model in models]))
 
 
 def make_residual_eeg_cnn():
@@ -816,6 +890,8 @@ def make_eeg_model(model_name):
             if isinstance(module, torch.nn.Dropout):
                 module.p = 0.0
         return model
+    if model_name in ('cnn-transformer', 'cnn_transformer'):
+        return make_small_eeg_cnn_transformer()
     raise ValueError(f"Unknown EEG model: {model_name}")
 
 
@@ -856,6 +932,155 @@ def empirical_cdf_score(probability, calibration_probabilities):
     starts = np.cumsum(counts) - counts
     quantiles = (starts + counts / 2) / len(calibration)
     return float(np.interp(float(probability), values, quantiles))
+
+
+def _annotation_summary(values):
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values) & (values >= 0) & (values <= 1)]
+    if not len(values):
+        return [np.nan] * 5
+    return [
+        float(np.mean(values)),
+        float(np.std(values)),
+        float(np.quantile(values, 0.1)),
+        float(np.quantile(values, 0.5)),
+        float(np.quantile(values, 0.9)),
+    ]
+
+
+def _annotation_event_features(signal, duration_hours):
+    values = np.asarray(signal.data)
+    valid = np.isfinite(values) & (values >= 0) & (values < 9)
+    active = valid & (values > 0)
+    starts = np.count_nonzero(np.diff(active.astype(np.int8), prepend=0) == 1)
+    return [
+        starts / duration_hours,
+        active.sum() / float(signal.sampling_frequency) / 60 / duration_hours,
+        float(active.sum() / max(1, valid.sum())),
+    ]
+
+
+def extract_caisr_annotation_features(path):
+    """Summarize the CAISR signals that are also present in hidden data."""
+    try:
+        edf = edfio.read_edf(path, lazy_load_data=False)
+        signals = {signal.label: signal for signal in edf.signals}
+        duration_hours = max(float(edf.duration) / 3600, 1e-6)
+        features = [duration_hours]
+        for label in ('arousal_caisr', 'limb_caisr', 'resp_caisr'):
+            signal = signals.get(label)
+            features.extend(_annotation_event_features(signal, duration_hours) if signal is not None else [np.nan] * 3)
+
+        stages = np.asarray(signals['stage_caisr'].data) if 'stage_caisr' in signals else np.array([])
+        stages = stages[np.isfinite(stages) & (stages >= 1) & (stages <= 5)]
+        features.extend([float(np.mean(stages == stage)) if len(stages) else np.nan for stage in range(1, 6)])
+        features.extend([
+            np.count_nonzero(np.diff(stages)) / duration_hours if len(stages) > 1 else np.nan,
+            float(np.mean(stages < 5)) if len(stages) else np.nan,
+        ])
+        for label in ('caisr_prob_arous', 'caisr_prob_n3', 'caisr_prob_n2', 'caisr_prob_n1', 'caisr_prob_r', 'caisr_prob_w'):
+            signal = signals.get(label)
+            features.extend(_annotation_summary(signal.data if signal is not None else []))
+        return np.asarray(features, dtype=np.float32)
+    except Exception:
+        return np.full(ANNOTATION_FEATURE_COUNT, np.nan, dtype=np.float32)
+
+
+def _extract_caisr_annotation_record(path):
+    return path, extract_caisr_annotation_features(path)
+
+
+def load_annotation_training_data(data_folder, num_workers=0):
+    demographics_path = os.path.join(data_folder, DEMOGRAPHICS_FILE)
+    with open(demographics_path, newline='') as f:
+        records = list(csv.DictReader(f))
+    paths = [
+        os.path.join(
+            data_folder,
+            ALGORITHMIC_ANNOTATIONS_SUBFOLDER,
+            record[HEADERS['site_id']],
+            f"{record[HEADERS['bids_folder']]}_ses-{record[HEADERS['session_id']]}_caisr_annotations.edf",
+        )
+        for record in records
+    ]
+    if num_workers > 1:
+        with ProcessPoolExecutor(max_workers=num_workers) as pool:
+            features_by_path = dict(pool.map(_extract_caisr_annotation_record, paths, chunksize=8))
+    else:
+        features_by_path = dict(map(_extract_caisr_annotation_record, paths))
+    annotation_features = np.asarray(
+        [features_by_path.get(path, np.full(ANNOTATION_FEATURE_COUNT, np.nan)) for path in paths],
+        dtype=np.float32,
+    )
+    demographics = np.asarray([[load_bmi(record)] for record in records], dtype=np.float32)
+    features = np.column_stack((demographics, annotation_features))
+    labels = np.asarray([load_label(record) for record in records], dtype=np.int8)
+    sites = np.asarray([record[HEADERS['site_id']] for record in records])
+    return features, labels, sites
+
+
+def make_annotation_model(seed=0):
+    from sklearn.ensemble import ExtraTreesClassifier
+    from sklearn.impute import SimpleImputer
+    from sklearn.pipeline import make_pipeline
+
+    return make_pipeline(
+        SimpleImputer(strategy='median', add_indicator=True),
+        ExtraTreesClassifier(
+            n_estimators=300,
+            min_samples_leaf=10,
+            max_features=0.7,
+            class_weight='balanced',
+            n_jobs=EEG_NUM_WORKERS,
+            random_state=seed,
+        ),
+    )
+
+
+def train_annotation_model(data_folder, folds=3, seed=0, num_workers=0):
+    from sklearn.model_selection import StratifiedKFold
+
+    features, labels, sites = load_annotation_training_data(data_folder, num_workers=num_workers)
+    if len(np.unique(labels)) < 2:
+        return None, np.array([], dtype=np.float32)
+
+    oof_probabilities = np.zeros(len(labels), dtype=np.float32)
+    splitter = StratifiedKFold(n_splits=folds, shuffle=True, random_state=seed)
+    for train_indices, validation_indices in splitter.split(features, labels):
+        fold_model = make_annotation_model(seed)
+        counts = {site: np.count_nonzero(sites[train_indices] == site) for site in np.unique(sites[train_indices])}
+        weights = np.asarray([counts[site] ** -0.5 for site in sites[train_indices]])
+        weights /= weights.mean()
+        fold_model.fit(
+            features[train_indices], labels[train_indices],
+            extratreesclassifier__sample_weight=weights,
+        )
+        oof_probabilities[validation_indices] = fold_model.predict_proba(features[validation_indices])[:, 1]
+
+    model = make_annotation_model(seed)
+    counts = {site: np.count_nonzero(sites == site) for site in np.unique(sites)}
+    weights = np.asarray([counts[site] ** -0.5 for site in sites])
+    weights /= weights.mean()
+    model.fit(features, labels, extratreesclassifier__sample_weight=weights)
+    return model, np.sort(oof_probabilities)
+
+
+def predict_annotation_probability(model, data_folder, site_id, patient_id, session_id, demographics):
+    annotation_model = model.get('annotation_model')
+    if annotation_model is None:
+        return None
+    path = os.path.join(
+        data_folder,
+        ALGORITHMIC_ANNOTATIONS_SUBFOLDER,
+        site_id,
+        f'{patient_id}_ses-{session_id}_caisr_annotations.edf',
+    )
+    if not os.path.exists(path):
+        return None
+    annotation_features = extract_caisr_annotation_features(path)
+    features = np.concatenate(([load_bmi(demographics)], annotation_features)).reshape(1, -1)
+    raw_probability = float(annotation_model.predict_proba(features)[0, 1])
+    return empirical_cdf_score(raw_probability, model.get('annotation_calibration_probabilities', []))
 
 
 def compute_internal_reward_metrics(labels, probabilities, ages, prevalence_labels, prevalence_ages):
