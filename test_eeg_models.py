@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 from analyze_age_residualization import residualize_logits
-from team_code import EEG_BINARY_THRESHOLD, EEG_CHANNEL_DROPOUT, EEG_EPOCHS, EEG_MIN_CHANNELS, EEG_MIN_WINDOWS, EEG_MODEL_FILE, EEG_MODEL_NAME, EEG_SEEDS, age_conditioned_pairwise_loss, apply_eeg_channel_dropout, compute_eeg_oof_metrics, eeg_checkpoint_score, empirical_cdf_score, load_model, make_eeg_model, rank_normalize_eeg_folds, sample_eeg_windows_tolerant, verify_eeg_cache
+from team_code import EEG_BINARY_THRESHOLD, EEG_CHANNEL_DROPOUT, EEG_EPOCHS, EEG_MODEL_TYPES, eeg_focal_factor, EEG_MIN_CHANNELS, EEG_MIN_WINDOWS, EEG_MODEL_FILE, EEG_MODEL_NAME, EEG_SEEDS, age_conditioned_pairwise_loss, apply_eeg_channel_dropout, compute_eeg_oof_metrics, eeg_checkpoint_score, empirical_cdf_score, load_model, make_eeg_model, rank_normalize_eeg_folds, sample_eeg_windows_tolerant, verify_eeg_cache
 
 
 class TestEEGModels(unittest.TestCase):
@@ -166,11 +166,36 @@ class TestEEGModels(unittest.TestCase):
                 verify_eeg_cache(cache_folder, verbose=False)
 
     def test_submission_config_matches_benchmarked_grid(self):
-        self.assertEqual(EEG_MODEL_NAME, 'cnn')
-        self.assertEqual(tuple(EEG_SEEDS), (0, 1, 2))
+        # The shipped ensemble is three architecture/loss variants x two seeds,
+        # measured at 0.7037 age-conditioned AUROC / 0.3080 reward on 3-fold OOF.
+        self.assertEqual(tuple(EEG_SEEDS), (0, 1))
         self.assertEqual(EEG_EPOCHS, 10)
         self.assertAlmostEqual(EEG_CHANNEL_DROPOUT, 0.15)
         self.assertAlmostEqual(EEG_BINARY_THRESHOLD, 0.75)
+        names = [spec['name'] for spec in EEG_MODEL_TYPES]
+        self.assertEqual(names, ['cnn_window', 'mil_focal2', 'mil_focalasym'])
+        modes = {spec['name']: spec['mode'] for spec in EEG_MODEL_TYPES}
+        self.assertEqual(modes['cnn_window'], 'window')
+        self.assertEqual(modes['mil_focal2'], 'subject')
+        # symmetric vs asymmetric focal is the difference between the two MIL members
+        focal = {spec['name']: spec['focal'] for spec in EEG_MODEL_TYPES}
+        self.assertEqual(focal['mil_focal2'], (2.0, 2.0))
+        self.assertEqual(focal['mil_focalasym'], (0.0, 2.0))
+
+    def test_mil_transformer_emits_one_logit_per_subject(self):
+        model = make_eeg_model('mil_transformer')
+        self.assertEqual(model(torch.zeros(3, 12, 6, 800)).shape, (3,))
+
+    def test_focal_factor_is_identity_when_disabled(self):
+        logits, targets = torch.randn(8), (torch.rand(8) > 0.5).float()
+        self.assertEqual(eeg_focal_factor(logits, targets, 0.0, 0.0), 1.0)
+
+    def test_asymmetric_focal_spares_easy_positives(self):
+        logits = torch.tensor([4.0, -4.0])   # confident positive, confident negative
+        targets = torch.tensor([1.0, 0.0])
+        asym = eeg_focal_factor(logits, targets, 0.0, 2.0)
+        self.assertAlmostEqual(float(asym[0]), 1.0, places=5)
+        self.assertLess(float(asym[1]), 0.01)
 
 
 if __name__ == '__main__':

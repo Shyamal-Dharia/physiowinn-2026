@@ -62,8 +62,20 @@ EEG_MODEL_FILE = 'eeg_model.pt'
 #   - 10 epochs, predictions averaged over every epoch: per-epoch scores swing
 #     0.680-0.691 with no learnable peak (per-run argmax was [1,43,3,1,...]),
 #     so snapshot averaging replaces a coin flip with a stable 0.688.
-EEG_SEEDS = (0, 1, 2)
+# Three model types, equal weight. Measured 3-fold OOF (array 805144 + search):
+# window CNN 0.6882, MIL-transformer focal g=2 0.7012, focal asymmetric 0.7002;
+# the three together 0.7037 with reward 0.3080. They differ in architecture and
+# loss, which is where the ensemble gain comes from -- adding seeds of one type
+# was worth only +0.007, adding a second architecture was worth more.
+EEG_MODEL_TYPES = (
+    {'name': 'cnn_window', 'arch': 'cnn', 'mode': 'window', 'focal': (0.0, 0.0)},
+    {'name': 'mil_focal2', 'arch': 'mil_transformer', 'mode': 'subject', 'focal': (2.0, 2.0)},
+    {'name': 'mil_focalasym', 'arch': 'mil_transformer', 'mode': 'subject', 'focal': (0.0, 2.0)},
+)
+EEG_SEEDS = (0, 1)
 EEG_EPOCHS = 10
+EEG_MIL_BATCH_SUBJECTS = 32
+EEG_MIL_WINDOWS_PER_STEP = 64
 EEG_CHANNEL_DROPOUT = 0.15
 # Window count barely matters: 0.7004 at 300, 0.6992 at 30, 0.6957 at 10. A
 # subject we accept on 20 windows still scores ~0.698; one we discard falls
@@ -153,36 +165,41 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
     train_subjects, val_subjects = split_eeg_subjects(cache_folder, val_fraction=0.2, seed=EEG_SEED)
 
     models = []
-    seed_scores = []
-    for seed in EEG_SEEDS:
-        if verbose:
-            print(f'Training EEG {EEG_MODEL_NAME} seed {seed}...')
-        snapshots, val_probabilities = train_eeg_snapshot_model(
-            cache_folder,
-            train_subjects=train_subjects,
-            val_subjects=val_subjects,
-            epochs=EEG_EPOCHS,
-            batch_size=EEG_BATCH_SIZE,
-            num_workers=EEG_NUM_WORKERS,
-            seed=seed,
-            model_name=EEG_MODEL_NAME,
-            channel_dropout=EEG_CHANNEL_DROPOUT,
-            verbose=verbose,
-        )
-        calibration = np.sort(val_probabilities)
-        models.append({
-            'model_name': EEG_MODEL_NAME,
-            'seed': int(seed),
-            'snapshot_state_dicts': snapshots,
-            'calibration_probabilities': calibration,
-        })
-        seed_scores.append([empirical_cdf_score(p, calibration) for p in val_probabilities])
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    member_scores = []
+    for spec in EEG_MODEL_TYPES:
+        for seed in EEG_SEEDS:
+            if verbose:
+                print(f"Training EEG {spec['name']} seed {seed}...")
+            snapshots, val_probabilities = train_eeg_snapshot_model(
+                cache_folder,
+                train_subjects=train_subjects,
+                val_subjects=val_subjects,
+                epochs=EEG_EPOCHS,
+                batch_size=EEG_BATCH_SIZE,
+                num_workers=EEG_NUM_WORKERS,
+                seed=seed,
+                model_name=spec['arch'],
+                channel_dropout=EEG_CHANNEL_DROPOUT,
+                mode=spec['mode'],
+                focal=spec['focal'],
+                verbose=verbose,
+            )
+            calibration = np.sort(val_probabilities)
+            models.append({
+                'model_name': spec['arch'],
+                'type_name': spec['name'],
+                'mode': spec['mode'],
+                'seed': int(seed),
+                'snapshot_state_dicts': snapshots,
+                'calibration_probabilities': calibration,
+            })
+            member_scores.append([empirical_cdf_score(p, calibration) for p in val_probabilities])
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     # Ensemble exactly as measured: per-seed CDF, mean across seeds, CDF again
     # so the stored binary threshold lands on a true rank.
-    ensemble_scores = np.mean(seed_scores, axis=0)
+    ensemble_scores = np.mean(member_scores, axis=0)
     ensemble_calibration = np.sort(ensemble_scores)
     ensemble_ranks = np.asarray([empirical_cdf_score(s, ensemble_calibration) for s in ensemble_scores])
     val_metrics = compute_internal_reward_metrics(
@@ -197,6 +214,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
         'ensemble_calibration_probabilities': ensemble_calibration,
         'binary_threshold': EEG_BINARY_THRESHOLD,
         'seeds': list(EEG_SEEDS),
+        'model_types': [spec['name'] for spec in EEG_MODEL_TYPES],
         'epochs': EEG_EPOCHS,
         'channel_dropout': EEG_CHANNEL_DROPOUT,
         'validation_metrics': val_metrics,
@@ -281,12 +299,17 @@ def run_model(model, record, data_folder, verbose):
                     x = torch.from_numpy(windows.astype(np.float32, copy=False)).to(model.get('device', 'cpu'))
                     scores = []
                     for saved_model in model['models']:
-                        # Average over snapshot epochs and windows, then map
-                        # through this seed's calibration, as measured.
-                        raw = float(np.mean([
-                            float(torch.sigmoid(net(x)).mean().item())
-                            for net in saved_model['snapshots']
-                        ]))
+                        # Average over snapshot epochs, then map through this
+                        # member's calibration, as measured. Window models
+                        # average per-window sigmoids; MIL models emit one
+                        # subject-level logit from all windows at once.
+                        per_snapshot = []
+                        for net in saved_model['snapshots']:
+                            if saved_model.get('mode', 'window') == 'subject':
+                                per_snapshot.append(float(torch.sigmoid(net(x[None])).item()))
+                            else:
+                                per_snapshot.append(float(torch.sigmoid(net(x)).mean().item()))
+                        raw = float(np.mean(per_snapshot))
                         scores.append(empirical_cdf_score(raw, saved_model['calibration_probabilities']))
                     eeg_probability = empirical_cdf_score(
                         float(np.mean(scores)), model['ensemble_calibration_probabilities'],
@@ -925,7 +948,47 @@ def make_residual_eeg_cnn():
     )
 
 
+def make_mil_transformer(num_channels=None):
+    """Subject-level model: encode each window, let windows attend to each
+    other, then pool. Beat plain window classification 0.7012 vs 0.6882."""
+    import torch
+
+    body = list(make_small_eeg_cnn(num_channels))
+    encoder, head_in = torch.nn.Sequential(*body[:-1]), body[-1].in_features
+
+    class MILTransformer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = encoder
+            layer = torch.nn.TransformerEncoderLayer(
+                d_model=head_in, nhead=4, dim_feedforward=2 * head_in,
+                dropout=0.0, batch_first=True, norm_first=True)
+            self.context = torch.nn.TransformerEncoder(layer, num_layers=2)
+            self.head = torch.nn.Linear(head_in, 1)
+
+        def forward(self, x):
+            batch, windows, channels, samples = x.shape
+            h = self.encoder(x.reshape(batch * windows, channels, samples)).reshape(batch, windows, -1)
+            return self.head(self.context(h).mean(dim=1)).flatten()
+
+    return MILTransformer()
+
+
+def eeg_focal_factor(logits, targets, gamma_pos, gamma_neg):
+    """(1 - p_t)^gamma with per-class gammas; 0/0 disables it."""
+    import torch
+
+    if not gamma_pos and not gamma_neg:
+        return 1.0
+    p = torch.sigmoid(logits)
+    p_t = p * targets + (1 - p) * (1 - targets)
+    gamma = gamma_pos * targets + gamma_neg * (1 - targets)
+    return (1 - p_t).clamp_min(1e-6) ** gamma
+
+
 def make_eeg_model(model_name):
+    if model_name == 'mil_transformer':
+        return make_mil_transformer()
     if model_name == 'cnn':
         return make_small_eeg_cnn()
     if model_name == 'rescnn':
@@ -1213,7 +1276,7 @@ def estimate_age_prevalence(age, prevalence_labels, prevalence_ages, gap=2, fall
     return max(float(prevalence_labels[mask].sum()), 0.5) / int(mask.sum())
 
 
-def predict_eeg_subject_probabilities(model, val_loader, device=None):
+def predict_eeg_subject_probabilities(model, val_loader, device=None, mode='window'):
     import torch
 
     device = device or next(model.parameters()).device
@@ -1222,10 +1285,14 @@ def predict_eeg_subject_probabilities(model, val_loader, device=None):
     labels = []
     with torch.no_grad():
         for x, y in val_loader:
-            batch_size, num_windows, channels, time = x.shape
-            x = x.reshape(batch_size * num_windows, channels, time).to(device)
-            window_probs = torch.sigmoid(model(x).reshape(batch_size, num_windows)).mean(dim=1)
-            probs.extend(window_probs.cpu().numpy().tolist())
+            x = x.to(device)
+            if mode == 'subject':
+                subject_probs = torch.sigmoid(model(x))
+            else:
+                batch_size, num_windows, channels, time = x.shape
+                flat = x.reshape(batch_size * num_windows, channels, time)
+                subject_probs = torch.sigmoid(model(flat).reshape(batch_size, num_windows)).mean(dim=1)
+            probs.extend(subject_probs.float().cpu().numpy().tolist())
             labels.extend(y.numpy().tolist())
 
     return np.asarray(labels, dtype=np.int8), np.asarray(probs, dtype=np.float32)
@@ -1555,35 +1622,45 @@ def apply_eeg_channel_dropout(x, rate):
     return x * keep
 
 
-def train_eeg_snapshot_model(cache_folder, train_subjects, val_subjects, epochs=EEG_EPOCHS, batch_size=EEG_BATCH_SIZE, lr=1e-3, num_workers=0, seed=0, model_name=EEG_MODEL_NAME, channel_dropout=EEG_CHANNEL_DROPOUT, device=None, verbose=True):
+def train_eeg_snapshot_model(cache_folder, train_subjects, val_subjects, epochs=EEG_EPOCHS, batch_size=EEG_BATCH_SIZE, lr=1e-3, num_workers=0, seed=0, model_name=EEG_MODEL_NAME, channel_dropout=EEG_CHANNEL_DROPOUT, device=None, verbose=True, mode='window', focal=(0.0, 0.0)):
     """
     Train one EEG model, keeping every epoch's weights as a snapshot.
 
+    mode='window'  : classify 4s windows, average their sigmoids per subject
+    mode='subject' : multiple-instance -- one logit per subject from all windows
+
     Returns (snapshot_state_dicts, val_probabilities) where val_probabilities
-    are subject-level probabilities averaged over all snapshots -- the epoch
+    are subject-level probabilities averaged over all snapshots; the epoch
     curve has no learnable peak, so averaging replaces checkpoint selection.
     """
     import torch
+    from torch.utils.data import DataLoader, Subset
 
     torch.manual_seed(seed)
     np.random.seed(seed)
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
     labels = np.load(os.path.join(cache_folder, 'y.npy')).astype(np.int8)
 
-    train_loader, val_loader, _, _ = make_eeg_supervised_loaders(
-        cache_folder,
-        batch_size=batch_size,
-        seed=seed,
-        num_workers=num_workers,
-        train_subjects=train_subjects,
-        val_subjects=val_subjects,
-    )
+    subject_dataset = EEGCacheDataset(cache_folder, level='subject', normalize=True)
+    val_loader = DataLoader(Subset(subject_dataset, val_subjects),
+                            batch_size=4, shuffle=False, num_workers=num_workers)
+    if mode == 'subject':
+        train_loader = DataLoader(Subset(subject_dataset, train_subjects),
+                                  batch_size=EEG_MIL_BATCH_SUBJECTS, shuffle=True,
+                                  num_workers=num_workers, drop_last=True)
+    else:
+        window_dataset = EEGCacheDataset(cache_folder, level='window', normalize=True)
+        num_windows = window_dataset.shape[1]
+        train_loader = DataLoader(Subset(window_dataset, _window_indices(train_subjects, num_windows)),
+                                  batch_size=batch_size, shuffle=True, num_workers=num_workers)
 
     counts = np.bincount(labels[train_subjects].astype(int), minlength=2)
     model = make_eeg_model(model_name).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     pos_weight = torch.tensor([counts[0] / max(1, counts[1])], dtype=torch.float32, device=device)
-    loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    use_focal = bool(focal[0] or focal[1])
+    loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight,
+                                         reduction='none' if use_focal else 'mean')
 
     snapshots = []
     epoch_probabilities = []
@@ -1591,19 +1668,31 @@ def train_eeg_snapshot_model(cache_folder, train_subjects, val_subjects, epochs=
         model.train()
         losses = []
         for x, yb in train_loader:
-            x = x.to(device)
-            if channel_dropout:
-                x = apply_eeg_channel_dropout(x, channel_dropout)
-            yb = yb.to(device)
+            x, yb = x.to(device), yb.to(device)
+            if mode == 'subject':
+                if EEG_MIL_WINDOWS_PER_STEP < x.shape[1]:
+                    pick = torch.randperm(x.shape[1], device=x.device)[:EEG_MIL_WINDOWS_PER_STEP]
+                    x = x[:, pick]
+                b, w, c, t = x.shape
+                flat = x.reshape(b * w, c, t)
+                if channel_dropout:
+                    flat = apply_eeg_channel_dropout(flat, channel_dropout)
+                logits = model(flat.reshape(b, w, c, t))
+            else:
+                if channel_dropout:
+                    x = apply_eeg_channel_dropout(x, channel_dropout)
+                logits = model(x).flatten()
+            loss = loss_fn(logits, yb)
+            if use_focal:
+                loss = (loss * eeg_focal_factor(logits, yb, focal[0], focal[1])).mean()
             optimizer.zero_grad(set_to_none=True)
-            loss = loss_fn(model(x).flatten(), yb)
             loss.backward()
             optimizer.step()
             losses.append(float(loss.detach().cpu()))
 
         snapshots.append({k: v.detach().cpu().clone() for k, v in model.state_dict().items()})
-        _, probabilities = predict_eeg_subject_probabilities(model, val_loader, device=device)
-        epoch_probabilities.append(probabilities)
+        epoch_probabilities.append(predict_eeg_subject_probabilities(model, val_loader,
+                                                                    device=device, mode=mode)[1])
         if verbose:
             print(f'  epoch={epoch}/{epochs} loss={np.mean(losses):.4f}', flush=True)
 
