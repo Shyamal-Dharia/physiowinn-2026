@@ -44,19 +44,35 @@ TARGET_EEG_FS = 200.0
 EEG_BANDPASS_HZ = (0.1, 45.0)
 EEG_SEGMENT_SECONDS = 4.0
 EEG_NUM_WINDOWS = 300
-EEG_EPOCHS = 50
 EEG_BATCH_SIZE = 512
 EEG_NUM_WORKERS = min(4, os.cpu_count() or 1)
-EEG_MODEL_NAME = 'rescnn'
-EEG_MODEL_NAMES = ('cnn', 'rescnn')
-EEG_BLEND_WEIGHTS = (0.4, 0.6)
+EEG_MODEL_NAME = 'cnn'
 EEG_SEED = 0
 EEG_AGE_RANK_WEIGHT = 0.0
 EEG_AGE_RANK_GAP = 2.0
 EEG_CHECKPOINT_METRIC = 'age_conditioned_auroc'
 EEG_MODEL_FILE = 'eeg_model.pt'
-ANNOTATION_BLEND_WEIGHT = 0.675
-ANNOTATION_FOLDS = 3
+
+# Config locked by the 36-run robustness grid (slurm array 796793) on the
+# repaired cache; see analyze_robust_eeg.py and results/robust_eeg_report.json.
+#   - CNN only: adding ResCNN moved the 3-seed ensemble 0.6878 -> 0.6847 (worse).
+#   - 3 seeds: +0.007 over a single seed.
+#   - Channel dropout 0.15: +0.009 clean, and the decisive robustness result --
+#     zeroing one channel costs 0.045 AUROC without it and 0.002 with it.
+#   - 10 epochs, predictions averaged over every epoch: per-epoch scores swing
+#     0.680-0.691 with no learnable peak (per-run argmax was [1,43,3,1,...]),
+#     so snapshot averaging replaces a coin flip with a stable 0.688.
+EEG_SEEDS = (0, 1, 2)
+EEG_EPOCHS = 10
+EEG_CHANNEL_DROPOUT = 0.15
+# Window count barely matters: 0.7004 at 300, 0.6992 at 30, 0.6957 at 10. A
+# subject we accept on 20 windows still scores ~0.698; one we discard falls
+# back to age prevalence and contributes chance. So keep the floor low.
+EEG_MIN_WINDOWS = 20
+EEG_MIN_CHANNELS = 2
+# Reward is maximized by calling positives above this rank; broad optimum
+# (0.246 at 0.80, 0.264 at 0.75, 0.218 at 0.50) vs 0.004 for the shipped CNN.
+EEG_BINARY_THRESHOLD = 0.75
 ANNOTATION_FEATURE_COUNT = 47
 
 ################################################################################
@@ -130,53 +146,60 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
     )
     if meta['subjects_kept'] == 0:
         raise RuntimeError('No subjects with usable EEG windows.')
+    verify_eeg_cache(cache_folder, verbose=verbose)
 
     labels = np.load(os.path.join(cache_folder, 'y.npy')).astype(np.int8)
     ages = load_cache_subject_ages(cache_folder, data_folder)
+    train_subjects, val_subjects = split_eeg_subjects(cache_folder, val_fraction=0.2, seed=EEG_SEED)
+
     models = []
-    for model_name in EEG_MODEL_NAMES:
+    seed_scores = []
+    for seed in EEG_SEEDS:
         if verbose:
-            print(f'Training EEG {model_name}...')
-        net, history, calibration_probabilities = train_eeg_baseline(
+            print(f'Training EEG {EEG_MODEL_NAME} seed {seed}...')
+        snapshots, val_probabilities = train_eeg_snapshot_model(
             cache_folder,
+            train_subjects=train_subjects,
+            val_subjects=val_subjects,
             epochs=EEG_EPOCHS,
             batch_size=EEG_BATCH_SIZE,
-            data_folder=data_folder,
             num_workers=EEG_NUM_WORKERS,
-            seed=EEG_SEED,
-            model_name=model_name,
-            return_calibration=True,
-            age_rank_weight=EEG_AGE_RANK_WEIGHT,
-            age_rank_gap=EEG_AGE_RANK_GAP,
-            checkpoint_metric=EEG_CHECKPOINT_METRIC,
+            seed=seed,
+            model_name=EEG_MODEL_NAME,
+            channel_dropout=EEG_CHANNEL_DROPOUT,
+            verbose=verbose,
         )
-        best = max(history, key=lambda row: eeg_checkpoint_score(row, EEG_CHECKPOINT_METRIC))
+        calibration = np.sort(val_probabilities)
         models.append({
-            'model_name': model_name,
-            'model_state_dict': {name: value.detach().cpu() for name, value in net.state_dict().items()},
-            'calibration_probabilities': calibration_probabilities,
-            'selected_epoch': int(best['epoch']),
-            'history': history,
+            'model_name': EEG_MODEL_NAME,
+            'seed': int(seed),
+            'snapshot_state_dicts': snapshots,
+            'calibration_probabilities': calibration,
         })
-        del net
+        seed_scores.append([empirical_cdf_score(p, calibration) for p in val_probabilities])
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    if verbose:
-        print('Training CAISR annotation model...')
-    annotation_model, annotation_calibration = train_annotation_model(
-        data_folder,
-        folds=ANNOTATION_FOLDS,
-        seed=EEG_SEED,
-        num_workers=EEG_NUM_WORKERS,
+    # Ensemble exactly as measured: per-seed CDF, mean across seeds, CDF again
+    # so the stored binary threshold lands on a true rank.
+    ensemble_scores = np.mean(seed_scores, axis=0)
+    ensemble_calibration = np.sort(ensemble_scores)
+    ensemble_ranks = np.asarray([empirical_cdf_score(s, ensemble_calibration) for s in ensemble_scores])
+    val_metrics = compute_internal_reward_metrics(
+        labels[val_subjects], ensemble_ranks, ages[val_subjects],
+        labels[train_subjects], ages[train_subjects],
     )
+    if verbose:
+        print(f"Validation age-conditioned AUROC: {val_metrics.get('age_conditioned_auroc', float('nan')):.4f}")
+
     checkpoint = {
         'models': models,
-        'blend_weights': EEG_BLEND_WEIGHTS,
-        'seed': EEG_SEED,
-        'annotation_model': annotation_model,
-        'annotation_calibration_probabilities': annotation_calibration,
-        'annotation_blend_weight': ANNOTATION_BLEND_WEIGHT,
+        'ensemble_calibration_probabilities': ensemble_calibration,
+        'binary_threshold': EEG_BINARY_THRESHOLD,
+        'seeds': list(EEG_SEEDS),
+        'epochs': EEG_EPOCHS,
+        'channel_dropout': EEG_CHANNEL_DROPOUT,
+        'validation_metrics': val_metrics,
         'prevalence_labels': labels,
         'prevalence_ages': ages,
         'fallback_prevalence': float(labels.mean()),
@@ -184,6 +207,8 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
         'target_fs': TARGET_EEG_FS,
         'bandpass': EEG_BANDPASS_HZ,
         'num_windows': EEG_NUM_WINDOWS,
+        'min_windows': EEG_MIN_WINDOWS,
+        'min_channels': EEG_MIN_CHANNELS,
     }
     torch.save(checkpoint, os.path.join(model_folder, EEG_MODEL_FILE))
     import shutil
@@ -200,20 +225,14 @@ def load_model(model_folder, verbose):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     checkpoint = torch.load(os.path.join(model_folder, EEG_MODEL_FILE), map_location='cpu', weights_only=False)
-    if 'models' in checkpoint:
-        for saved_model in checkpoint['models']:
+    for saved_model in checkpoint['models']:
+        nets = []
+        for state_dict in saved_model['snapshot_state_dicts']:
             net = make_eeg_model(saved_model['model_name']).to(device)
-            net.load_state_dict(saved_model['model_state_dict'])
+            net.load_state_dict(state_dict)
             net.eval()
-            saved_model['model'] = net
-        checkpoint['device'] = device
-        return checkpoint
-
-    # Backward compatibility for earlier single-model checkpoints.
-    net = make_eeg_model(checkpoint['model_name']).to(device)
-    net.load_state_dict(checkpoint['model_state_dict'])
-    net.eval()
-    checkpoint['model'] = net
+            nets.append(net)
+        saved_model['snapshots'] = nets
     checkpoint['device'] = device
     return checkpoint
 
@@ -247,51 +266,43 @@ def run_model(model, record, data_folder, verbose):
                 target_fs=model['target_fs'],
                 bandpass=tuple(model['bandpass']) if model['bandpass'] is not None else None,
             )
-            windows = sample_eeg_windows(
+            windows = sample_eeg_windows_tolerant(
                 eeg_signals,
                 fs,
                 num_windows=int(model['num_windows']),
                 channels=tuple(model['channels']),
+                min_windows=int(model.get('min_windows', EEG_MIN_WINDOWS)),
+                min_channels=int(model.get('min_channels', EEG_MIN_CHANNELS)),
                 rng=0,
             )
-            expected_shape = (
-                int(model['num_windows']), len(model['channels']),
-                int(round(EEG_SEGMENT_SECONDS * model['target_fs'])),
-            )
-            if windows.shape == expected_shape:
+            if windows is not None:
                 windows = (windows - windows.mean(axis=-1, keepdims=True)) / (windows.std(axis=-1, keepdims=True) + 1e-6)
                 with torch.no_grad():
                     x = torch.from_numpy(windows.astype(np.float32, copy=False)).to(model.get('device', 'cpu'))
-                    if 'models' in model:
-                        scores = []
-                        for saved_model in model['models']:
-                            raw_probability = float(torch.sigmoid(saved_model['model'](x)).mean().item())
-                            scores.append(empirical_cdf_score(raw_probability, saved_model['calibration_probabilities']))
-                        eeg_probability = float(np.average(scores, weights=model['blend_weights']))
-                    else:
-                        eeg_probability = float(torch.sigmoid(model['model'](x)).mean().item())
+                    scores = []
+                    for saved_model in model['models']:
+                        # Average over snapshot epochs and windows, then map
+                        # through this seed's calibration, as measured.
+                        raw = float(np.mean([
+                            float(torch.sigmoid(net(x)).mean().item())
+                            for net in saved_model['snapshots']
+                        ]))
+                        scores.append(empirical_cdf_score(raw, saved_model['calibration_probabilities']))
+                    eeg_probability = empirical_cdf_score(
+                        float(np.mean(scores)), model['ensemble_calibration_probabilities'],
+                    )
         except Exception as exc:
             if verbose:
                 print(f'EEG inference failed for {patient_id}: {exc}')
 
-    annotation_probability = predict_annotation_probability(
-        model, data_folder, site_id, patient_id, session_id, patient_data,
-    )
-    if eeg_probability is not None and annotation_probability is not None:
-        annotation_weight = float(model.get('annotation_blend_weight', 0.0))
-        probability_output = (1 - annotation_weight) * eeg_probability + annotation_weight * annotation_probability
-    elif eeg_probability is not None:
-        probability_output = eeg_probability
-    elif annotation_probability is not None:
-        probability_output = annotation_probability
+    if eeg_probability is not None and np.isfinite(eeg_probability):
+        probability_output = float(np.clip(eeg_probability, 0, 1))
+        binary_output = bool(probability_output > float(model.get('binary_threshold', EEG_BINARY_THRESHOLD)))
     else:
-        probability_output = prevalence
-
-    if not np.isfinite(probability_output):
-        probability_output = prevalence
-    probability_output = float(np.clip(probability_output, 0, 1))
-    threshold = 0.5 if eeg_probability is not None or annotation_probability is not None else np.clip(prevalence * float(model.get('threshold_scale', 1.0)), 1e-6, 1 - 1e-6)
-    binary_output = bool(probability_output > threshold)
+        # No usable EEG: fall back to the age-conditioned prevalence, where the
+        # reward-optimal call is positive exactly when the estimate exceeds it.
+        probability_output = float(np.clip(prevalence, 0, 1))
+        binary_output = False
     return binary_output, probability_output
 
 ################################################################################
@@ -461,6 +472,69 @@ def sample_eeg_windows(eeg_signals, fs, num_windows=200, channels=EEG_CHANNELS, 
         np.stack([eeg_signals[channel][starts[i]:starts[i] + window] for channel in channels])
         for i in chosen
     ]).astype(np.float32, copy=False)
+
+
+def sample_eeg_windows_tolerant(eeg_signals, fs, num_windows, channels, min_windows, min_channels, rng=None, segment_seconds=EEG_SEGMENT_SECONDS):
+    """
+    Like sample_eeg_windows, but degrades instead of discarding the subject.
+
+    Missing derivations are zero-filled (models are trained with channel
+    dropout, so a zeroed channel is in-distribution) and fewer than
+    num_windows is accepted down to min_windows. Returns (N, C, T) or None
+    when too little usable signal remains.
+    """
+    window = int(round(segment_seconds * fs))
+    available = [channel for channel in channels if channel in eeg_signals and len(eeg_signals[channel]) >= window]
+    if len(available) < min_channels:
+        return None
+
+    max_len = min(len(eeg_signals[channel]) for channel in available)
+    num_candidates = max(0, (max_len - window) // window + 1)
+    if num_candidates == 0:
+        return None
+
+    clean = [
+        start * window
+        for start in range(num_candidates)
+        if all(is_clean_eeg_segment(eeg_signals[c][start * window:start * window + window]) for c in available)
+    ]
+    if len(clean) < min_windows:
+        return None
+
+    if len(clean) > num_windows:
+        chosen = [clean[i] for i in np.linspace(0, len(clean) - 1, num_windows, dtype=int)]
+    else:
+        chosen = clean
+
+    out = np.zeros((len(chosen), len(channels), window), dtype=np.float32)
+    for position, channel in enumerate(channels):
+        if channel not in available:
+            continue
+        signal = eeg_signals[channel]
+        for row, start in enumerate(chosen):
+            out[row, position] = signal[start:start + window]
+    return out
+
+
+def verify_eeg_cache(cache_folder, verbose=True):
+    """Fail loudly on a cache with zero-filled subjects.
+
+    A contiguous extent of a previous cache was lost to a filesystem
+    write-back failure, silently zeroing 11.5% of subjects (and 99.6% of one
+    site) while training and validation ran on it as if it were signal.
+    """
+    with open(os.path.join(cache_folder, 'meta.json')) as f:
+        shape = tuple(json.load(f)['shape'])
+    X = np.memmap(os.path.join(cache_folder, 'X.dat'), dtype=np.float32, mode='r', shape=shape)
+    damaged = [i for i in range(shape[0]) if not np.abs(X[i, 0]).max() > 0]
+    del X
+    if damaged:
+        raise RuntimeError(
+            f'EEG cache has {len(damaged)} zero-filled subjects (first: {damaged[:5]}); '
+            'rebuild before training.'
+        )
+    if verbose:
+        print(f'EEG cache verified: {shape[0]} subjects, no zero-filled records.')
 
 
 def _build_eeg_cache_record(task):
@@ -1470,6 +1544,70 @@ def train_eeg_baseline(cache_folder, model_path=None, epochs=3, batch_size=128, 
         return model, history, np.sort(calibration_probabilities)
 
     return model, history
+
+
+def apply_eeg_channel_dropout(x, rate):
+    """Zero random channels per window, never all of them."""
+    import torch
+
+    keep = torch.rand(x.shape[0], x.shape[1], 1, device=x.device) >= rate
+    keep |= ~keep.any(dim=1, keepdim=True)
+    return x * keep
+
+
+def train_eeg_snapshot_model(cache_folder, train_subjects, val_subjects, epochs=EEG_EPOCHS, batch_size=EEG_BATCH_SIZE, lr=1e-3, num_workers=0, seed=0, model_name=EEG_MODEL_NAME, channel_dropout=EEG_CHANNEL_DROPOUT, device=None, verbose=True):
+    """
+    Train one EEG model, keeping every epoch's weights as a snapshot.
+
+    Returns (snapshot_state_dicts, val_probabilities) where val_probabilities
+    are subject-level probabilities averaged over all snapshots -- the epoch
+    curve has no learnable peak, so averaging replaces checkpoint selection.
+    """
+    import torch
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+    labels = np.load(os.path.join(cache_folder, 'y.npy')).astype(np.int8)
+
+    train_loader, val_loader, _, _ = make_eeg_supervised_loaders(
+        cache_folder,
+        batch_size=batch_size,
+        seed=seed,
+        num_workers=num_workers,
+        train_subjects=train_subjects,
+        val_subjects=val_subjects,
+    )
+
+    counts = np.bincount(labels[train_subjects].astype(int), minlength=2)
+    model = make_eeg_model(model_name).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    pos_weight = torch.tensor([counts[0] / max(1, counts[1])], dtype=torch.float32, device=device)
+    loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    snapshots = []
+    epoch_probabilities = []
+    for epoch in range(1, epochs + 1):
+        model.train()
+        losses = []
+        for x, yb in train_loader:
+            x = x.to(device)
+            if channel_dropout:
+                x = apply_eeg_channel_dropout(x, channel_dropout)
+            yb = yb.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            loss = loss_fn(model(x).flatten(), yb)
+            loss.backward()
+            optimizer.step()
+            losses.append(float(loss.detach().cpu()))
+
+        snapshots.append({k: v.detach().cpu().clone() for k, v in model.state_dict().items()})
+        _, probabilities = predict_eeg_subject_probabilities(model, val_loader, device=device)
+        epoch_probabilities.append(probabilities)
+        if verbose:
+            print(f'  epoch={epoch}/{epochs} loss={np.mean(losses):.4f}', flush=True)
+
+    return snapshots, np.mean(epoch_probabilities, axis=0)
 
 
 def extract_demographic_features(data):

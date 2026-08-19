@@ -4,12 +4,35 @@ This repository contains a trainable submission for predicting future cognitive 
 
 ## Model
 
-The prediction is a calibrated blend of:
+The prediction comes from a single EEG branch: a lightweight convolutional network over 300
+four-second windows drawn uniformly from six canonical EEG derivations.
 
-- a site-balanced Extra Trees model over BMI and automated CAISR sleep-stage, arousal, respiratory-event, and limb-movement summaries; and
-- lightweight convolutional and residual convolutional EEG models over 300 four-second windows from six canonical EEG derivations.
+- **Ensemble.** Three seeds, ten epochs each. Every epoch's weights are kept as a snapshot and
+  predictions are averaged over all thirty, because the per-epoch validation curve swings
+  0.680-0.691 with no learnable peak - snapshot averaging replaces checkpoint selection with a
+  stable estimate instead of a coin flip.
+- **Channel dropout (0.15).** Random derivations are zeroed per window during training. This is
+  worth +0.009 on clean data, but its real purpose is robustness: zeroing one channel at inference
+  costs 0.045 age-conditioned AUROC without it and 0.002 with it.
+- **Tolerant inference.** Missing derivations are zero-filled (in-distribution, thanks to channel
+  dropout) and subjects are accepted down to 20 clean windows and 2 channels. A degraded subject
+  still scores ~0.698, so accepting it always beats falling back to a chance-level prevalence
+  estimate.
+- **Calibration and decision rule.** Raw probabilities are mapped through the empirical CDF of
+  validation scores per seed, averaged, then ranked again. Positives are called above rank 0.75,
+  which is what the Challenge reward metric rewards - it depends only on the binary output, and the
+  optimum is broad (0.246 at 0.80, 0.264 at 0.75, 0.218 at 0.50).
 
-The final weights are 67.5% CAISR and 32.5% EEG. Within the EEG branch, the CNN and residual CNN weights are 40% and 60%, respectively. Missing annotations or EEG channels fall back to the available branch and ultimately to age-conditioned training prevalence.
+Subjects with no usable EEG fall back to the age-conditioned training prevalence.
+
+The training run verifies the EEG cache before use and fails loudly on zero-filled subjects, after a
+filesystem write-back failure once silently zeroed 11.5% of the cache and corrupted every internal
+measurement taken against it.
+
+An earlier version blended a CAISR/tabular branch at 67.5%. It was removed: whether the BMI field is
+populated is a curation artifact that correlates strongly with the label, which inflates random-split
+cross-validation but does not transfer. That blend scored 0.821 internally and 0.599 officially,
+while the EEG branch alone transfers in the other direction (0.684 internal, 0.748 official).
 
 ## Authors
 
