@@ -2,7 +2,7 @@
 
 ## eeg-focal-ensemble-oof-0704
 
-- commit: `ae9cfe6`
+- commit: `0036425`
 - branch: `official-refresh`
 - internal: age-conditioned AUROC `0.7037`, reward `0.3080` (3-fold OOF, snapshot-averaged, no checkpoint selection)
 - notes: EEG only. Six models -- window CNN, MIL-transformer with symmetric focal
